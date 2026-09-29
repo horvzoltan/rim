@@ -14,6 +14,8 @@ pub enum Mode {
     Branches,
     /// Pick a file to `@`-mention in the Claude prompt.
     Mention,
+    /// Pick a quick fix (LSP code action) for the cursor position.
+    CodeActions,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +124,7 @@ impl Palette {
             Mode::GotoLine => "Line number",
             Mode::Branches => "Checkout branch",
             Mode::Mention => "Mention a file",
+            Mode::CodeActions => "Quick fix",
         }
     }
 

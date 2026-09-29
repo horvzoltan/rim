@@ -584,10 +584,10 @@ fn very_long_single_line() {
 fn diagnostics_render_and_hover_collects_them() {
     let mut h = H::with_path("fn main() {\n    let 😀x = 1;\n}\n", Some("/nonexistent/a.rs"), false);
     h.diagnostics = vec![
-        Diagnostic { start: (1, 8), end: (1, 11), severity: 1, message: "bad".into(), source: "rustc".into() },
+        Diagnostic { start: (1, 8), end: (1, 11), severity: 1, message: "bad".into(), source: "rustc".into(), raw: serde_json::Value::Null },
         // Multi-line and out-of-range diagnostics must not panic.
-        Diagnostic { start: (0, 0), end: (2, 1), severity: 2, message: "w".into(), source: String::new() },
-        Diagnostic { start: (50, 3), end: (60, 0), severity: 3, message: "far".into(), source: String::new() },
+        Diagnostic { start: (0, 0), end: (2, 1), severity: 2, message: "w".into(), source: String::new(), raw: serde_json::Value::Null },
+        Diagnostic { start: (50, 3), end: (60, 0), severity: 3, message: "far".into(), source: String::new(), raw: serde_json::Value::Null },
     ];
     h.frame(vec![]);
     // UTF-16 col 8 on line 1 is after "    let " -> char 20; the emoji is 2 UTF-16 units.
@@ -706,7 +706,7 @@ fn apply_completion_text_edit_range_and_additional_edits() {
         "additionalTextEdits": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "newText": "use std::string::String;\n" }]
     }]));
     let cursor = doc.index.lsp_to_char(&doc.text, 1, 10);
-    let sel = apply_completion(&mut doc, &items[0], cursor);
+    let (sel, _) = apply_completion(&mut doc, &items[0], cursor);
     assert_eq!(doc.text, "use std::string::String;\nuse x;\nlet a = String::new()\n");
     let expected = doc.text.find("()").unwrap() + 2;
     assert_eq!(sel, (expected, expected));

@@ -18,12 +18,27 @@ pub enum Pending {
     Hover { doc_id: u64, char_idx: usize },
     Definition,
     Formatting { doc_id: u64, base_hash: u64, then_save: bool },
+    /// `completionItem/resolve` after a completion was accepted: its import edits land if the
+    /// text before `at` (a char index) still hashes to `prefix_hash`.
+    ResolveCompletion { doc_id: u64, at: usize, prefix_hash: u64 },
+    /// `textDocument/codeAction` for the quick-fix menu (request `seq`).
+    CodeActions { seq: u64, server: String },
+    /// `codeAction/resolve` for an action picked without its edit.
+    ResolveCodeAction { server: String },
+    ExecuteCommand,
+    /// `textDocument/diagnostic` (pull diagnostics) for `uri` at document `version`.
+    PullDiagnostics { uri: String, version: i32 },
 }
 
 pub enum LspEvent {
     Response { pending: Pending, result: Result<Value, String> },
-    Diagnostics { uri: String, diagnostics: Vec<Diagnostic> },
+    /// `server` is filled in by the app (a client doesn't know its name). `pulled`: the answer to a
+    /// `textDocument/diagnostic` request rather than a pushed `publishDiagnostics`; a server may
+    /// do both (e.g. its own checks pulled, a build's pushed), so the two are kept apart.
+    Diagnostics { server: String, uri: String, diagnostics: Vec<Diagnostic>, pulled: bool },
     ShowMessage { level: u8, message: String },
+    /// The server wants a workspace edit applied (`workspace/applyEdit`); answer with `Client::reply`.
+    ApplyEdit { id: Value, edit: Value },
     /// The server rejected `initialize`; it is unusable.
     InitFailed(String),
     Exited,
@@ -38,6 +53,8 @@ pub struct Diagnostic {
     pub severity: u8,
     pub message: String,
     pub source: String,
+    /// The diagnostic as the server sent it, passed back as code-action context.
+    pub raw: Value,
 }
 
 pub struct Client {
@@ -53,6 +70,22 @@ pub struct Client {
     /// Active `$/progress` messages by token.
     progress: HashMap<String, String>,
     pub opened: std::collections::HashSet<String>,
+    /// Document version last sent, by URI.
+    sent: HashMap<String, i32>,
+    /// Pull diagnostics: the server's id for its last answer per URI (sent back to get "unchanged"),
+    /// and the URIs with a request in flight (`true`: ask again when it's answered).
+    result_ids: HashMap<String, String>,
+    pulling: HashMap<String, bool>,
+    /// Answers to `workspace/configuration` (by section); null when the server has none.
+    settings: Value,
+}
+
+/// The part of `settings` for a dotted `section` (`"yaml.format"`); the whole object for "".
+fn section(settings: &Value, section: &str) -> Value {
+    if settings.is_null() {
+        return Value::Null;
+    }
+    section.split('.').filter(|s| !s.is_empty()).try_fold(settings, |v, key| v.get(key)).cloned().unwrap_or(Value::Null)
 }
 
 pub fn uri(path: &Path) -> String {
@@ -68,11 +101,24 @@ pub fn pos(v: &Value) -> (usize, usize) {
 }
 
 impl Client {
+    #[cfg(test)]
     pub fn start(command: &[String], root: &Path, init_options: Value, ctx: egui::Context) -> Result<Client, String> {
+        Self::start_with(command, root, init_options, Value::Null, &Default::default(), ctx)
+    }
+
+    pub fn start_with(
+        command: &[String],
+        root: &Path,
+        init_options: Value,
+        settings: Value,
+        env: &std::collections::BTreeMap<String, String>,
+        ctx: egui::Context,
+    ) -> Result<Client, String> {
         let (prog, args) = command.split_first().ok_or("empty command")?;
         let prog = find_in_path(prog).ok_or_else(|| format!("`{prog}` not found in PATH"))?;
         let mut child = Command::new(prog)
             .args(args)
+            .envs(env)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -125,6 +171,10 @@ impl Client {
             triggers: Vec::new(),
             progress: HashMap::new(),
             opened: Default::default(),
+            settings,
+            sent: HashMap::new(),
+            result_ids: HashMap::new(),
+            pulling: HashMap::new(),
         };
         let root_uri = uri(root);
         let root_name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -138,7 +188,13 @@ impl Client {
             "capabilities": {
                 "general": { "positionEncodings": ["utf-16"] },
                 "window": { "workDoneProgress": true },
-                "workspace": { "configuration": true, "workspaceFolders": true },
+                "workspace": {
+                    "configuration": true,
+                    "workspaceFolders": true,
+                    "applyEdit": true,
+                    "workspaceEdit": { "documentChanges": true },
+                    "diagnostics": { "refreshSupport": true },
+                },
                 "textDocument": {
                     "synchronization": { "didSave": true, "dynamicRegistration": false },
                     "completion": {
@@ -146,13 +202,24 @@ impl Client {
                             "snippetSupport": true,
                             "labelDetailsSupport": true,
                             "documentationFormat": ["plaintext", "markdown"],
+                            // Auto-import edits may come later, from `completionItem/resolve`.
+                            "resolveSupport": { "properties": ["additionalTextEdits", "detail", "documentation"] },
                         },
                         "contextSupport": true,
                     },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
                     "definition": { "linkSupport": true },
                     "formatting": {},
+                    "codeAction": {
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": { "valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"] },
+                        },
+                        "isPreferredSupport": true,
+                        "dataSupport": true,
+                        "resolveSupport": { "properties": ["edit"] },
+                    },
                     "publishDiagnostics": { "relatedInformation": false },
+                    "diagnostic": { "dynamicRegistration": false, "relatedDocumentSupport": false },
                 },
             },
         });
@@ -181,24 +248,44 @@ impl Client {
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
     }
 
+    /// Answer a server-to-client request that was handed to the app (see `LspEvent::ApplyEdit`).
+    pub fn reply(&mut self, id: Value, result: Value) {
+        self.write(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    }
+
     pub fn notify(&mut self, method: &str, params: Value) {
         self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
     }
 
+    pub fn version_sent(&self, uri: &str) -> Option<i32> {
+        self.sent.get(uri).copied()
+    }
+
     pub fn did_open(&mut self, uri: &str, lang: &str, version: i32, text: &str) {
+        self.sent.insert(uri.to_string(), version);
         if self.opened.insert(uri.to_string()) {
             self.notify(
                 "textDocument/didOpen",
                 json!({ "textDocument": { "uri": uri, "languageId": lang, "version": version, "text": text } }),
             );
+            self.pull_diagnostics(uri);
         }
     }
 
     pub fn did_change(&mut self, uri: &str, version: i32, text: &str) {
+        self.sent.insert(uri.to_string(), version);
         self.notify(
             "textDocument/didChange",
             json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }),
         );
+        self.pull_diagnostics(uri);
+        // Other files' problems can depend on this one (a changed export, a fixed type).
+        if self.capabilities["diagnosticProvider"]["interFileDependencies"].as_bool() == Some(true) {
+            let others: Vec<String> = self.opened.iter().filter(|u| *u != uri).cloned().collect();
+            for u in others {
+                self.pull_diagnostics(&u);
+            }
+        }
     }
 
     pub fn did_save(&mut self, uri: &str, text: &str) {
@@ -206,8 +293,67 @@ impl Client {
     }
 
     pub fn did_close(&mut self, uri: &str) {
+        self.sent.remove(uri);
+        self.result_ids.remove(uri);
         if self.opened.remove(uri) {
             self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }));
+        }
+    }
+
+    /// Whether the server wants its diagnostics asked for (`textDocument/diagnostic`).
+    pub fn pulls_diagnostics(&self) -> bool {
+        self.ready && self.supports("diagnosticProvider")
+    }
+
+    /// Ask for a document's diagnostics (pull model). One request per document at a time: asking
+    /// again while one is in flight re-asks once it is answered, so typing doesn't pile them up.
+    pub fn pull_diagnostics(&mut self, uri: &str) {
+        if !self.pulls_diagnostics() || !self.opened.contains(uri) {
+            return;
+        }
+        if let Some(again) = self.pulling.get_mut(uri) {
+            *again = true;
+            return;
+        }
+        self.pulling.insert(uri.to_string(), false);
+        let version = self.sent.get(uri).copied().unwrap_or(0);
+        let mut params = json!({ "textDocument": { "uri": uri } });
+        if let Some(id) = self.result_ids.get(uri) {
+            params["previousResultId"] = json!(id);
+        }
+        if let Some(id) = self.capabilities["diagnosticProvider"]["identifier"].as_str() {
+            params["identifier"] = json!(id);
+        }
+        self.request("textDocument/diagnostic", params, Pending::PullDiagnostics { uri: uri.to_string(), version });
+    }
+
+    /// Handle a pull-diagnostics answer: new diagnostics become an event (unless the document
+    /// changed since it was asked for, in which case it is asked again).
+    fn pulled(&mut self, uri: String, version: i32, msg: &Value, events: &mut Vec<LspEvent>) {
+        let mut again = self.pulling.remove(&uri).unwrap_or(false);
+        if !self.opened.contains(&uri) {
+            return;
+        }
+        if let Some(e) = msg.get("error") {
+            // ServerCancelled (e.g. the document changed): retry unless the server says not to.
+            again |= e["code"].as_i64() == Some(-32802) && e["data"]["retriggerRequest"].as_bool() != Some(false);
+        } else {
+            let r = &msg["result"];
+            match r["resultId"].as_str() {
+                Some(id) => self.result_ids.insert(uri.clone(), id.to_string()),
+                None => self.result_ids.remove(&uri),
+            };
+            let current = self.sent.get(&uri) == Some(&version);
+            if r["kind"] == "full" && current {
+                let diagnostics = r["items"].as_array().map(|a| a.iter().map(parse_diagnostic).collect()).unwrap_or_default();
+                events.push(LspEvent::Diagnostics { server: String::new(), uri: uri.clone(), diagnostics, pulled: true });
+            } else if !current {
+                self.result_ids.remove(&uri);
+                again = true;
+            }
+        }
+        if again {
+            self.pull_diagnostics(&uri);
         }
     }
 
@@ -237,6 +383,10 @@ impl Client {
                 // Response to one of our requests.
                 (None, Some(id)) => {
                     let Some(p) = id.as_i64().and_then(|id| self.pending.remove(&id)) else { continue };
+                    if let Pending::PullDiagnostics { uri, version } = p {
+                        self.pulled(uri, version, &msg, &mut events);
+                        continue;
+                    }
                     let result = match msg.get("error") {
                         Some(e) => Err(e["message"].as_str().unwrap_or("error").to_string()),
                         None => Ok(msg["result"].clone()),
@@ -260,22 +410,39 @@ impl Client {
                         for m in std::mem::take(&mut self.queue) {
                             self.write(&m);
                         }
+                        // Documents opened while starting up: ask for their diagnostics now.
+                        let opened: Vec<String> = self.opened.iter().cloned().collect();
+                        for u in opened {
+                            self.pull_diagnostics(&u);
+                        }
                     } else {
                         events.push(LspEvent::Response { pending: p, result });
                     }
                 }
+                // The app applies workspace edits and answers itself.
+                (Some(method), Some(id)) if method == "workspace/applyEdit" => {
+                    events.push(LspEvent::ApplyEdit { id: id.clone(), edit: msg["params"]["edit"].clone() });
+                }
                 // Request from the server: reply with something harmless.
                 (Some(method), Some(id)) => {
+                    let refresh = method == "workspace/diagnostic/refresh";
                     let result = match method.as_str() {
                         "workspace/configuration" => {
-                            let n = msg["params"]["items"].as_array().map(|a| a.len()).unwrap_or(0);
-                            Value::Array(vec![Value::Null; n])
+                            let items = msg["params"]["items"].as_array().cloned().unwrap_or_default();
+                            Value::Array(items.iter().map(|it| section(&self.settings, it["section"].as_str().unwrap_or(""))).collect())
                         }
-                        "workspace/applyEdit" => json!({ "applied": false }),
                         "workspace/workspaceFolders" => Value::Array(vec![]),
                         _ => Value::Null,
                     };
                     self.write(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                    // The server's view changed (project loaded, config edited): ask again for every file.
+                    if refresh {
+                        self.result_ids.clear();
+                        let opened: Vec<String> = self.opened.iter().cloned().collect();
+                        for u in opened {
+                            self.pull_diagnostics(&u);
+                        }
+                    }
                 }
                 // Notification.
                 (Some(method), None) => match method.as_str() {
@@ -285,7 +452,7 @@ impl Client {
                             .as_array()
                             .map(|a| a.iter().map(parse_diagnostic).collect())
                             .unwrap_or_default();
-                        events.push(LspEvent::Diagnostics { uri: p["uri"].as_str().unwrap_or("").into(), diagnostics });
+                        events.push(LspEvent::Diagnostics { server: String::new(), uri: p["uri"].as_str().unwrap_or("").into(), diagnostics, pulled: false });
                     }
                     "$/progress" => {
                         let p = &msg["params"];
@@ -385,6 +552,7 @@ fn parse_diagnostic(d: &Value) -> Diagnostic {
         severity: d["severity"].as_u64().unwrap_or(1) as u8,
         message: d["message"].as_str().unwrap_or("").to_string(),
         source: d["source"].as_str().unwrap_or("").to_string(),
+        raw: d.clone(),
     }
 }
 
@@ -428,6 +596,8 @@ pub struct CompletionItem {
     /// Replace range end, if the server gave a textEdit.
     pub edit_end: Option<(usize, usize)>,
     pub additional: Vec<AdditionalEdit>,
+    /// The item as the server sent it, for `completionItem/resolve`.
+    pub raw: Value,
 }
 
 pub fn parse_completions(result: &Value) -> (Vec<CompletionItem>, bool) {
@@ -454,16 +624,7 @@ pub fn parse_completions(result: &Value) -> (Vec<CompletionItem>, bool) {
             if detail.is_empty() {
                 detail = it["labelDetails"]["description"].as_str().unwrap_or("").to_string();
             }
-            let additional = it["additionalTextEdits"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|e| {
-                            (pos(&e["range"]["start"]), pos(&e["range"]["end"]), e["newText"].as_str().unwrap_or("").into())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let additional = text_edits(&it["additionalTextEdits"]);
             CompletionItem {
                 filter: it["filterText"].as_str().unwrap_or(&label).to_string(),
                 sort: it["sortText"].as_str().unwrap_or(&label).to_string(),
@@ -475,11 +636,77 @@ pub fn parse_completions(result: &Value) -> (Vec<CompletionItem>, bool) {
                 edit_start,
                 edit_end,
                 additional,
+                raw: it.clone(),
             }
         })
         .collect();
     out.sort_by(|a, b| a.sort.cmp(&b.sort));
     (out, incomplete)
+}
+
+/// `TextEdit[]` as (start, end, new text), positions in (line, utf-16 col).
+pub fn text_edits(v: &Value) -> Vec<AdditionalEdit> {
+    v.as_array()
+        .map(|a| a.iter().map(|e| (pos(&e["range"]["start"]), pos(&e["range"]["end"]), e["newText"].as_str().unwrap_or("").into())).collect())
+        .unwrap_or_default()
+}
+
+/// A `WorkspaceEdit` as text edits per document URI, in the order the server listed them.
+/// Resource operations (create / rename / delete files) are not supported and are reported as an error.
+pub fn workspace_edits(edit: &Value) -> Result<Vec<(String, Vec<AdditionalEdit>)>, String> {
+    let mut out: Vec<(String, Vec<AdditionalEdit>)> = Vec::new();
+    let mut add = |uri: &str, edits: Vec<AdditionalEdit>| match out.iter_mut().find(|(u, _)| u == uri) {
+        Some((_, e)) => e.extend(edits),
+        None => out.push((uri.to_string(), edits)),
+    };
+    if let Some(changes) = edit["documentChanges"].as_array() {
+        for c in changes {
+            match c["kind"].as_str() {
+                Some(k) => return Err(format!("file {k} operations are not supported")),
+                None => add(c["textDocument"]["uri"].as_str().unwrap_or(""), text_edits(&c["edits"])),
+            }
+        }
+    } else if let Some(changes) = edit["changes"].as_object() {
+        for (uri, edits) in changes {
+            add(uri, text_edits(edits));
+        }
+    }
+    out.retain(|(u, e)| !u.is_empty() && !e.is_empty());
+    Ok(out)
+}
+
+/// One entry of the quick-fix menu.
+#[derive(Clone, Debug)]
+pub struct CodeAction {
+    pub title: String,
+    /// `quickfix`, `source.organizeImports`, … (empty for a bare `Command`).
+    pub kind: String,
+    pub preferred: bool,
+    /// The server that offered it (edits are resolved and commands run there).
+    pub server: String,
+    /// The `CodeAction` or `Command` as the server sent it.
+    pub raw: Value,
+}
+
+/// Parse a `textDocument/codeAction` result (`(Command | CodeAction)[]`), dropping disabled ones.
+pub fn parse_code_actions(result: &Value, server: &str) -> Vec<CodeAction> {
+    result
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|v| v["disabled"].is_null())
+                .filter_map(|v| {
+                    Some(CodeAction {
+                        title: v["title"].as_str()?.to_string(),
+                        kind: v["kind"].as_str().unwrap_or("").to_string(),
+                        preferred: v["isPreferred"].as_bool().unwrap_or(false),
+                        server: server.to_string(),
+                        raw: v.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Normalize Location | Location[] | LocationLink[] to (uri, start position).
@@ -495,24 +722,40 @@ pub fn first_location(result: &Value) -> Option<(String, (usize, usize))> {
     Some((loc["uri"].as_str()?.to_string(), pos(&loc["range"]["start"])))
 }
 
-/// Decide how to run the TypeScript/JavaScript server. The project's own
-/// `node_modules/typescript` wins over a global install.
-/// - TypeScript 7+ (native) has a built-in server: `tsc --lsp --stdio`.
-/// - Older versions go through typescript-language-server, which only looks in
-///   the project's node_modules, so we pass it the path to `tsserver.js`.
-pub fn typescript_launch(root: &Path, default: &[String]) -> (Vec<String>, Value) {
-    let local_tsc = root.join("node_modules/.bin/tsc");
-    let tsc = if local_tsc.is_file() { Some(local_tsc) } else { find_in_path("tsc") };
-    let Some(tsc) = tsc else { return (default.to_vec(), json!({})) };
-    let Some(ts_dir) = tsc.canonicalize().ok().and_then(|p| Some(p.parent()?.parent()?.to_path_buf())) else {
-        return (default.to_vec(), json!({}));
-    };
-    let tsserver = ts_dir.join("lib/tsserver.js");
-    if tsserver.is_file() {
-        (default.to_vec(), json!({ "tsserver": { "path": tsserver } }))
-    } else {
-        let tsc = tsc.to_string_lossy().to_string();
-        (vec![tsc, "--lsp".into(), "--stdio".into()], json!({}))
+/// Decide how to run the TypeScript/JavaScript server (see `typescript_launch_with`).
+/// TypeScript 7+ (native) has a built-in server, `tsc --lsp --stdio`; older versions go through
+/// typescript-language-server, which only looks in the project's node_modules, so it gets the
+/// path to `tsserver.js`.
+pub fn typescript_launch(root: &Path, default: &[String], bundled: Option<&Path>) -> (Vec<String>, Value) {
+    typescript_launch_with(root, default, bundled, find_in_path("tsc"))
+}
+
+/// How to run TypeScript for `root`: the project's own TypeScript first; without one, a global
+/// TypeScript that still ships `tsserver.js` (5, 6), then rim's bundled copy (`bundled`, the path
+/// of its `tsserver.js`) over a global TypeScript 7, whose native `tsc --lsp` is the last resort.
+/// Returns the command and the initialization options to merge.
+pub fn typescript_launch_with(root: &Path, default: &[String], bundled: Option<&Path>, global_tsc: Option<std::path::PathBuf>) -> (Vec<String>, Value) {
+    let ts_dir = |tsc: &Path| tsc.canonicalize().ok().and_then(|p| Some(p.parent()?.parent()?.to_path_buf()));
+    let tsserver_of = |tsc: &Path| ts_dir(tsc).map(|d| d.join("lib/tsserver.js")).filter(|p| p.is_file());
+    let native = |tsc: &Path| (vec![tsc.to_string_lossy().to_string(), "--lsp".into(), "--stdio".into()], json!({}));
+    let with_tsserver = |p: &Path| (default.to_vec(), json!({ "tsserver": { "path": p } }));
+    let local = root.join("node_modules/.bin/tsc");
+    if local.is_file() {
+        // The project's own TypeScript, whichever version it is.
+        return match tsserver_of(&local) {
+            Some(ts) => with_tsserver(&ts),
+            None => native(&local),
+        };
+    }
+    if let Some(ts) = global_tsc.as_deref().and_then(tsserver_of) {
+        return with_tsserver(&ts);
+    }
+    if let Some(b) = bundled.filter(|b| b.is_file()) {
+        return with_tsserver(b);
+    }
+    match global_tsc {
+        Some(tsc) => native(&tsc),
+        None => (default.to_vec(), json!({})),
     }
 }
 

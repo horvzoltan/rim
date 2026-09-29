@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Where a server's diagnostics are kept: pushed and pulled ones separately, so neither replaces the other.
+pub(super) fn diag_key(server: &str, pulled: bool) -> String {
+    if pulled { format!("{server}\u{1}pull") } else { server.to_string() }
+}
+
+/// The server a `diag_key` belongs to.
+pub(super) fn diag_owner(key: &str) -> &str {
+    key.strip_suffix("\u{1}pull").unwrap_or(key)
+}
+
 impl App {
     pub(super) fn format(&mut self, i: usize, then_save: bool) {
         let doc = &self.docs[i];
@@ -60,56 +70,82 @@ impl App {
         }
     }
 
-    /// Make sure the doc's language server runs and knows the doc. Returns the server name.
+    /// Make sure the doc's language servers run and know the doc. Returns the main server's name
+    /// (the one for completion, hover and formatting); add-on servers only report diagnostics.
     pub(super) fn ensure_lsp(&mut self, i: usize) -> Option<String> {
-        let doc = &self.docs[i];
-        let path = doc.path.clone()?;
-        let server = self.cfg.server_for_ext(&doc.ext)?.clone();
+        self.docs[i].path.as_ref()?;
+        let mut main = None;
+        for (k, server) in self.servers_for_doc(i).into_iter().enumerate() {
+            let started = self.ensure_server(i, &server);
+            if k == 0 && started {
+                main = Some(server.name);
+            }
+        }
+        main
+    }
+
+    /// Start `server` if needed and open / update the doc in it.
+    fn ensure_server(&mut self, i: usize, server: &config::ServerConfig) -> bool {
+        let Some(path) = self.docs[i].path.clone() else { return false };
         if self.lsp_failed.contains(&server.name) {
-            return None;
+            return false;
         }
         if !self.lsp.contains_key(&server.name) {
             let mut opts = server
-                .initialization_options
-                .as_ref()
-                .and_then(|t| serde_json::to_value(t).ok())
+                .init_json
+                .clone()
+                .or_else(|| server.initialization_options.as_ref().and_then(|t| serde_json::to_value(t).ok()))
                 .unwrap_or_else(|| json!({}));
             let mut command = server.command.clone();
             // Only auto-detect when the user hasn't customized the command.
-            if server.name == "typescript-language-server" && command.first().is_some_and(|c| c == "typescript-language-server") {
-                let (cmd, ts_opts) = lsp::typescript_launch(&self.root, &command);
+            if server.name == "typescript-language-server"
+                && (server.managed || command.first().is_some_and(|c| c == "typescript-language-server"))
+            {
+                // rim's own copy of TypeScript (from its install), preferred over a global TypeScript 7.
+                let bundled = opts["tsserver"]["fallbackPath"].as_str().map(PathBuf::from);
+                let (cmd, ts_opts) = lsp::typescript_launch(&self.root, &command, bundled.as_deref());
                 command = cmd;
                 if let (Some(o), Value::Object(ts)) = (opts.as_object_mut(), ts_opts) {
                     for (k, v) in ts {
-                        o.entry(k).or_insert(v);
+                        match (o.get_mut(&k), v) {
+                            // The project's TypeScript wins over the bundled fallback.
+                            (Some(Value::Object(mine)), Value::Object(theirs)) => mine.extend(theirs),
+                            (_, v) => {
+                                o.insert(k, v);
+                            }
+                        }
                     }
                 }
             }
-            match lsp::Client::start(&command, &self.root, opts, self.ctx.clone()) {
+            let settings = server.settings.clone().unwrap_or(Value::Null);
+            match lsp::Client::start_with(&command, &self.root, opts, settings, &server.env, self.ctx.clone()) {
                 Ok(c) => {
                     self.lsp.insert(server.name.clone(), c);
                     self.lsp_gen += 1;
                 }
                 Err(e) => {
                     self.lsp_failed.insert(server.name.clone());
+                    self.lsp_mgr.errors.insert(server.name.clone(), e.clone());
                     self.info(format!("{}: {e}", server.name));
-                    return None;
+                    return false;
                 }
             }
         }
-        let client = self.lsp.get_mut(&server.name)?;
+        let Some(client) = self.lsp.get_mut(&server.name) else { return false };
         let doc = &mut self.docs[i];
         let u = lsp::uri(&path);
-        if !client.opened.contains(&u) {
-            doc.lsp_version = 1;
-            doc.lsp_hash = doc.hash;
-            client.did_open(&u, config::language_id(&doc.ext), doc.lsp_version, &doc.text);
-        } else if doc.lsp_hash != doc.hash {
+        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        // One version number per document, shared by its servers; each server gets the text it hasn't seen.
+        if doc.lsp_hash != doc.hash || doc.lsp_version == 0 {
             doc.lsp_version += 1;
             doc.lsp_hash = doc.hash;
+        }
+        if !client.opened.contains(&u) {
+            client.did_open(&u, config::language_id_for(&doc.ext, &file_name), doc.lsp_version, &doc.text);
+        } else if client.version_sent(&u) != Some(doc.lsp_version) {
             client.did_change(&u, doc.lsp_version, &doc.text);
         }
-        Some(server.name)
+        true
     }
 
     /// Keep language servers in sync with the open documents. Cheap when nothing changed:
@@ -140,9 +176,14 @@ impl App {
     pub(super) fn poll_lsp(&mut self) {
         let mut events = vec![];
         let mut failed = vec![];
+        let mut apply = vec![];
         for (name, c) in self.lsp.iter_mut() {
             for e in c.poll() {
                 match e {
+                    LspEvent::ApplyEdit { id, edit } => apply.push((name.clone(), id, edit)),
+                    LspEvent::Diagnostics { uri, diagnostics, pulled, .. } => {
+                        events.push(LspEvent::Diagnostics { server: diag_key(name, pulled), uri, diagnostics, pulled })
+                    }
                     LspEvent::Exited => failed.push((name.clone(), "exited".to_string())),
                     LspEvent::InitFailed(msg) => failed.push((name.clone(), format!("failed to start: {msg}"))),
                     e => events.push(e),
@@ -156,11 +197,22 @@ impl App {
                 self.error(format!("{name} {why}\n(restart via command palette)"));
             }
         }
+        // Edits a server asks for (usually while running a quick fix's command).
+        for (name, id, edit) in apply {
+            let result = self.apply_workspace_edit(&edit);
+            if let Err(e) = &result {
+                self.error(format!("{name}: couldn't apply its edit: {e}"));
+            }
+            if let Some(c) = self.lsp.get_mut(&name) {
+                c.reply(id, match result {
+                    Ok(()) => json!({ "applied": true }),
+                    Err(e) => json!({ "applied": false, "failureReason": e }),
+                });
+            }
+        }
         for e in events {
             match e {
-                LspEvent::Diagnostics { uri, diagnostics } => {
-                    self.diagnostics.insert(uri, diagnostics);
-                }
+                LspEvent::Diagnostics { server, uri, diagnostics, .. } => self.set_diagnostics(server, uri, diagnostics),
                 LspEvent::ShowMessage { level, message } => {
                     if level <= 1 {
                         self.error(message);
@@ -169,7 +221,7 @@ impl App {
                     }
                 }
                 LspEvent::Response { pending, result } => self.handle_response(pending, result),
-                LspEvent::Exited | LspEvent::InitFailed(_) => {}
+                LspEvent::ApplyEdit { .. } | LspEvent::Exited | LspEvent::InitFailed(_) => {}
             }
         }
     }
@@ -178,8 +230,11 @@ impl App {
         let result = match result {
             Ok(v) => v,
             Err(e) => {
-                if matches!(pending, Pending::Formatting { .. }) {
-                    self.error(format!("Format failed: {e}"));
+                match pending {
+                    Pending::Formatting { .. } => self.error(format!("Format failed: {e}")),
+                    Pending::CodeActions { seq, server } => self.code_actions_arrived(seq, &server, None),
+                    Pending::ResolveCodeAction { .. } | Pending::ExecuteCommand => self.error(format!("Quick fix failed: {e}")),
+                    _ => {}
                 }
                 return;
             }
@@ -243,7 +298,11 @@ impl App {
                 }
                 self.apply_formatted(doc_id, base_hash, then_save, Ok(text));
             }
-            Pending::Initialize => {}
+            Pending::ResolveCompletion { doc_id, at, prefix_hash } => self.apply_resolved_completion(doc_id, at, prefix_hash, &result),
+            Pending::CodeActions { seq, server } => self.code_actions_arrived(seq, &server, Some(&result)),
+            Pending::ResolveCodeAction { server } => self.perform_code_action(&server, &result),
+            // Pull-diagnostics answers are handled inside the client.
+            Pending::PullDiagnostics { .. } | Pending::ExecuteCommand | Pending::Initialize => {}
         }
     }
 
@@ -252,6 +311,31 @@ impl App {
         self.lsp.clear();
         self.lsp_failed.clear();
         self.diagnostics.clear();
+        self.lsp_diags.clear();
+        self.lsp_mgr.clear_cache();
         self.info("Language servers restarted");
+    }
+
+    /// Store one server's diagnostics for a document and rebuild the merged list.
+    pub(super) fn set_diagnostics(&mut self, server: String, uri: String, diagnostics: Vec<Diagnostic>) {
+        self.lsp_diags.insert((server, uri.clone()), diagnostics);
+        let merged: Vec<Diagnostic> =
+            self.lsp_diags.iter().filter(|((_, u), _)| *u == uri).flat_map(|(_, d)| d.iter().cloned()).collect();
+        self.diagnostics.insert(uri, merged);
+    }
+
+    /// Stop a server (after an install, uninstall or when it's disabled) and forget its diagnostics.
+    /// Open documents move to whatever server now fits on the next sync.
+    pub(super) fn stop_server(&mut self, name: &str) {
+        self.lsp.remove(name);
+        self.lsp_failed.remove(name);
+        self.lsp_mgr.errors.remove(name);
+        let keys: Vec<(String, String)> = self.lsp_diags.keys().filter(|(s, _)| diag_owner(s) == name).cloned().collect();
+        for (s, u) in keys {
+            self.set_diagnostics(s.clone(), u.clone(), Vec::new());
+            self.lsp_diags.remove(&(s, u));
+        }
+        self.lsp_mgr.clear_cache();
+        self.lsp_gen += 1;
     }
 }

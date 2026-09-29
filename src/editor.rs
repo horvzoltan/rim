@@ -261,6 +261,9 @@ pub struct Hover {
 
 pub enum EditorEvent {
     Complete { anchor: usize },
+    /// A completion without its extra edits was accepted; its text starts at char `at`. The
+    /// server may add an import when asked for the item's details (`completionItem/resolve`).
+    CompletionAccepted { item: CompletionItem, at: usize },
     Hover(usize),
     Definition(usize),
     Save,
@@ -341,8 +344,55 @@ fn line_range(doc: &Document, a: usize, b: usize) -> (usize, usize) {
     (first, last)
 }
 
-/// Apply a completion item, returning the new selection.
-fn apply_completion(doc: &mut Document, item: &CompletionItem, cursor: usize) -> (usize, usize) {
+/// Apply language-server text edits ((line, utf-16 col) ranges, in the server's order) to a
+/// document, keeping the cursor and selection on the same text. Returns false if nothing changed.
+pub fn apply_text_edits(doc: &mut Document, edits: &[crate::lsp::AdditionalEdit]) -> bool {
+    let mut chars: Vec<(usize, usize, usize, &str)> = edits
+        .iter()
+        .enumerate()
+        .map(|(n, (s, e, t))| {
+            let a = doc.index.lsp_to_char(&doc.text, s.0, s.1);
+            let b = doc.index.lsp_to_char(&doc.text, e.0, e.1).max(a);
+            (a, b, n, t.as_str())
+        })
+        .collect();
+    if chars.is_empty() {
+        return false;
+    }
+    // Where a char position ends up after all edits.
+    let map = |p: usize| -> usize {
+        let mut delta: isize = 0;
+        for &(a, b, _, t) in &chars {
+            let len = t.chars().count() as isize;
+            if b <= p && !(a == b && a == p) {
+                delta += len - (b - a) as isize;
+            } else if a < p && p < b {
+                return (a as isize + delta + len).max(0) as usize;
+            }
+        }
+        (p as isize + delta).max(0) as usize
+    };
+    let (sa, sb) = doc.sel;
+    let cur = doc.cursor_char;
+    let (nsa, nsb, ncur) = (map(sa), map(sb), map(cur));
+    // Back to front; edits at the same position keep their order (per the LSP spec).
+    chars.sort_by_key(|e| std::cmp::Reverse((e.0, e.2)));
+    let before = doc.hash;
+    for &(a, b, _, t) in &chars {
+        replace_chars(&mut doc.text, a, b, t);
+    }
+    doc.refresh();
+    if doc.hash == before {
+        return false;
+    }
+    doc.sel = (nsa, nsb);
+    doc.cursor_char = ncur;
+    doc.pending_sel = Some(if sa == sb { (ncur, ncur) } else if cur == sa { (nsb, nsa) } else { (nsa, nsb) });
+    true
+}
+
+/// Apply a completion item, returning the new selection and where the item's text starts.
+fn apply_completion(doc: &mut Document, item: &CompletionItem, cursor: usize) -> ((usize, usize), usize) {
     let start = item
         .edit_start
         .map(|(l, c)| doc.index.lsp_to_char(&doc.text, l, c))
@@ -369,13 +419,14 @@ fn apply_completion(doc: &mut Document, item: &CompletionItem, cursor: usize) ->
     }
     doc.refresh();
     let base = (start as isize + shift) as usize;
-    match sel {
+    let sel = match sel {
         Some((a, b)) => (base + a, base + b),
         None => {
             let end = base + ins.chars().count();
             (end, end)
         }
-    }
+    };
+    (sel, base)
 }
 
 /// Editing keys we handle ourselves instead of egui. Returns a new selection if the text changed.
@@ -500,6 +551,12 @@ fn take_vim_keys(ui: &Ui, mode: vim::Mode) -> Vec<vim::Key> {
                 false
             }
             Event::Paste(_) | Event::Cut if modal => false,
+            // Input-method commits (CJK etc.) are keys like any other outside insert mode.
+            Event::Ime(egui::ImeEvent::Commit(s)) if modal => {
+                keys.extend(s.chars().filter(|c| !c.is_control()).map(vim::Key::Char));
+                false
+            }
+            Event::Ime(_) if modal => false,
             Event::Key { key, pressed: true, modifiers, .. } => {
                 let ctrl = modifiers.ctrl || modifiers.command;
                 if !modal {
@@ -685,9 +742,12 @@ pub fn show(ui: &mut Ui, doc: &mut Document, cx: &mut EditorCtx) -> Vec<EditorEv
         if let Some(item) = accept {
             *cx.completion = None;
             if !doc.read_only {
-                let sel = apply_completion(doc, &item, b);
+                let (sel, at) = apply_completion(doc, &item, b);
                 set_sel(&mut state, sel);
                 store = true;
+                if item.additional.is_empty() {
+                    events.push(EditorEvent::CompletionAccepted { item, at });
+                }
             }
         }
         if consume(Modifiers::COMMAND, Key::Space) {
@@ -960,11 +1020,14 @@ pub fn show(ui: &mut Ui, doc: &mut Document, cx: &mut EditorCtx) -> Vec<EditorEv
         if let Some(item) = accepted {
             *cx.completion = None;
             if !doc.read_only {
-                let sel = apply_completion(doc, &item, cursor);
+                let (sel, at) = apply_completion(doc, &item, cursor);
                 let mut st = TextEdit::load_state(&ctx, id).unwrap_or_default();
                 set_sel(&mut st, sel);
                 st.store(&ctx, id);
                 ctx.memory_mut(|m| m.request_focus(id));
+                if item.additional.is_empty() {
+                    events.push(EditorEvent::CompletionAccepted { item, at });
+                }
             }
         }
 
@@ -1097,6 +1160,10 @@ fn show_hover(ui: &Ui, cx: &mut EditorCtx, theme: &Theme, row_h: f32) {
                 ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (sev, msg) in &h.diags {
                         ui.label(egui::RichText::new(msg).color(theme.severity_color(*sev)).font(font.clone()));
+                    }
+                    if !h.diags.is_empty() {
+                        let key = if cfg!(target_os = "macos") { "Cmd+." } else { "Ctrl+." };
+                        ui.label(egui::RichText::new(format!("{key}: quick fixes")).color(theme.comment).size(font.size * 0.9));
                     }
                     if !h.diags.is_empty() && !text.is_empty() {
                         ui.separator();
@@ -1321,6 +1388,17 @@ mod tests {
         h.frame(vec![]);
         h.typing("vly$p");
         assert_eq!(h.doc.text, "abcab");
+    }
+
+    #[test]
+    fn ime_commits_are_keys_in_normal_mode_and_text_in_insert_mode() {
+        let mut h = Harness::new("abc", true);
+        h.frame(vec![]);
+        h.frame(vec![Event::Ime(egui::ImeEvent::Commit("x".into()))]);
+        assert_eq!(h.doc.text, "bc");
+        h.frame(vec![Event::Text("i".into())]);
+        h.frame(vec![Event::Ime(egui::ImeEvent::Commit("日本".into()))]);
+        assert_eq!(h.doc.text, "日本bc");
     }
 
     #[test]
