@@ -23,11 +23,14 @@ pub fn lock() -> MutexGuard<'static, ()> {
             std::env::set_var("XDG_CONFIG_HOME", b.join("config"));
             std::env::set_var("XDG_STATE_HOME", b.join("state"));
             std::env::set_var("XDG_CACHE_HOME", b.join("cache"));
+            std::env::set_var("XDG_DATA_HOME", b.join("data"));
         }
     });
     let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cfg = crate::config::Config::path();
     assert!(cfg.starts_with(base()), "refusing to touch a real config: {}", cfg.display());
+    let servers = crate::config::servers_dir();
+    assert!(servers.starts_with(base()), "refusing to touch real language servers: {}", servers.display());
     g
 }
 

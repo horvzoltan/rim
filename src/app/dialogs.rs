@@ -26,8 +26,9 @@ impl App {
         let mut keep = true;
         let mut dialog = dialog;
         let ctx = self.ctx.clone();
+        let wide = matches!(dialog, Dialog::Settings) && self.lsp_mgr.tab == lsp_manager::SettingsTab::LanguageServers;
         let resp = egui::Modal::new(Id::new("rim-dialog")).show(&ctx, |ui| {
-            ui.set_width(380.0);
+            ui.set_width(if wide { 760.0f32.min(ctx.content_rect().width() - 64.0) } else { 380.0 });
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
             let esc = ui.input(|i| i.key_pressed(Key::Escape));
             match &mut dialog {
@@ -132,8 +133,27 @@ impl App {
                     });
                 }
                 Dialog::Settings => {
-                    ui.label(RichText::new("Settings").size(17.0).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Settings").size(17.0).strong());
+                        ui.add_space(12.0);
+                        for (tab, label) in [(lsp_manager::SettingsTab::General, "General"), (lsp_manager::SettingsTab::LanguageServers, "Language Servers")] {
+                            ui.selectable_value(&mut self.lsp_mgr.tab, tab, label);
+                        }
+                    });
                     ui.add_space(6.0);
+                    if self.lsp_mgr.tab == lsp_manager::SettingsTab::LanguageServers {
+                        self.language_servers_ui(ui);
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() || esc {
+                                keep = false;
+                            }
+                        });
+                        if std::mem::take(&mut self.lsp_mgr.close_dialog) {
+                            keep = false;
+                        }
+                        return;
+                    }
                     let mut cfg = self.cfg.clone();
                     ui.checkbox(&mut cfg.vim_mode, "Vim motions");
                     ui.label(RichText::new("Modal editing (normal / insert / visual). Off means regular editing.").size(12.0).color(t.comment));
