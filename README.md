@@ -6,7 +6,8 @@ A small, fast code editor written in Rust (egui). It has no built-in terminal, b
 - Find in Files (`Ctrl+Shift+F`), like IntelliJ's: results appear as you type, with a highlighted preview of the
   selected match; arrows move, Enter opens it; match case and whole words toggles
 - File explorer (git-status colors, new/rename/move to trash), tabs, quick open (`Ctrl+P`), command palette (`Ctrl+Shift+P`)
-- Syntax highlighting for ~200 languages (syntect + bat's syntax set)
+- Syntax highlighting from real parse trees (tree-sitter) for Rust, JavaScript/TypeScript, Python, C/C++, Go, CSS, JSON, TOML,
+  YAML, HTML and shell; ~200 more languages via syntect
 - Language servers installed with one click (Settings → Language Servers), for ~30 languages
 - Language server features: diagnostics, completion (`Ctrl+Space` / as you type), hover (mouse or `Ctrl+K`), go to definition (`F12` / `Ctrl+click`), formatting
 - Auto-imports: completing a name from another module adds its import (TypeScript, Rust, …), and quick fixes
@@ -96,9 +97,10 @@ When enabled, each tab starts in normal mode; the status bar shows the mode.
 circle (bigger for longer files), every folder a tinted region, and every import a line. Scroll to zoom, drag the
 background to pan, drag a circle to move it, click one to see what it is, double-click to open it in the editor,
 `Esc` to go back. Zoomed out you see the folders; zoomed in, file names and icons appear.
-- **Imports** come from a quick text scan of `use`/`mod` (Rust), `import`/`require` (JS/TS), `from … import`
-  (Python), `#include "…"` (C/C++), `import` (Go, via `go.mod`) and `@import`/`@use` (CSS/SCSS), resolved to
-  files in the project. Unresolved ones (crates, packages, system headers) are counted as external.
+- **Imports** are read from tree-sitter parse trees: `use`/`mod` (Rust), `import`/`require` (JS/TS, and the
+  `<script>` of Vue/Svelte files), `from … import` (Python), `#include "…"` (C/C++) and `import` (Go, via `go.mod`);
+  `@import`/`@use` (CSS/SCSS) by a text scan. They are resolved to files in the project; unresolved ones (crates,
+  packages, system headers) are counted as external.
 - **Descriptions** start from the file's own comments (`//!`, a leading `/** */` or `#` block, a Python docstring)
   and a folder's `README.md`. *Describe with Claude* asks the local Claude Code CLI for a 1-2 sentence summary of
   the selected file or folder; *Describe all* does it for everything, one at a time, in the background.
@@ -137,7 +139,8 @@ models, `CLAUDE.md`, MCP servers, skills and permission rules work exactly as th
     cargo test -- --ignored                      # also talks to real rust-analyzer / Claude Code (uses a little plan usage)
     cargo test --release bench_frames -- --ignored --nocapture   # frame times on 5k–50k line files
 
-Large files stay responsive: highlighting parses lazily and only colours the visible lines, and git status,
+Large files stay responsive: highlighting parses in small time slices (tree-sitter edits the existing tree on each
+change) and only colours the visible lines, and git status,
 commits, project search and file listing run in the background.
 
 File-type icons come from [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) (MIT) and the

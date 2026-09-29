@@ -40,6 +40,8 @@ pub enum RustKind {
     Bare,
 }
 
+use super::ts_imports;
+
 // ---------- extraction ----------
 
 fn quoted(s: &str) -> Option<&str> {
@@ -51,12 +53,12 @@ fn quoted(s: &str) -> Option<&str> {
     Some(&inner[..end])
 }
 
-fn is_js_relative(spec: &str) -> bool {
+pub(super) fn is_js_relative(spec: &str) -> bool {
     spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/') || spec.starts_with("@/") || spec.starts_with("~/")
 }
 
 /// Rust `use` tree → list of paths (`a::{b, c::d}` → `[a::b, a::c::d]`); aliases and `*` dropped.
-fn rust_use_paths(tree: &str) -> Vec<Vec<String>> {
+pub(super) fn rust_use_paths(tree: &str) -> Vec<Vec<String>> {
     fn walk(s: &str, prefix: &[String], out: &mut Vec<Vec<String>>) {
         let s = s.trim();
         let s = s.split(" as ").next().unwrap_or(s).trim();
@@ -96,7 +98,7 @@ fn rust_use_paths(tree: &str) -> Vec<Vec<String>> {
     out
 }
 
-fn rust_path(mut segs: Vec<String>) -> Option<ImportRef> {
+pub(super) fn rust_path(mut segs: Vec<String>) -> Option<ImportRef> {
     let first = segs.first()?.as_str();
     let kind = match first {
         "crate" => {
@@ -119,172 +121,6 @@ fn rust_path(mut segs: Vec<String>) -> Option<ImportRef> {
     Some(ImportRef::RustPath { kind, segs })
 }
 
-fn extract_rust(text: &str, out: &mut Vec<ImportRef>) {
-    let mut pending_path: Option<String> = None;
-    let mut use_buf: Option<String> = None;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if let Some(buf) = &mut use_buf {
-            buf.push(' ');
-            buf.push_str(line);
-            if line.contains(';') {
-                let s = use_buf.take().unwrap();
-                let s = s.trim_end_matches(';').trim();
-                for p in rust_use_paths(s) {
-                    if let Some(r) = rust_path(p) {
-                        out.push(r);
-                    }
-                }
-            }
-            continue;
-        }
-        if line.starts_with("//") {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("#[path") {
-            pending_path = quoted(rest).map(String::from);
-            continue;
-        }
-        let mut item = line;
-        if let Some(r) = item.strip_prefix("pub") {
-            item = if let Some(r) = r.strip_prefix('(') { r.split_once(')').map(|x| x.1).unwrap_or("") } else { r };
-            item = item.trim_start();
-        }
-        if let Some(rest) = item.strip_prefix("mod ") {
-            let name = rest.trim().trim_end_matches(';').trim();
-            if rest.trim().ends_with(';') && !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                match pending_path.take() {
-                    Some(p) => out.push(ImportRef::Relative(p)),
-                    None => out.push(ImportRef::RustMod(name.to_string())),
-                }
-            }
-            continue;
-        }
-        pending_path = None;
-        if let Some(rest) = item.strip_prefix("use ") {
-            if rest.contains(';') {
-                for p in rust_use_paths(rest.trim_end_matches(';').split(';').next().unwrap_or("")) {
-                    if let Some(r) = rust_path(p) {
-                        out.push(r);
-                    }
-                }
-            } else {
-                use_buf = Some(rest.to_string());
-            }
-        }
-    }
-}
-
-fn extract_js(text: &str, out: &mut Vec<ImportRef>) {
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with("//") || line.starts_with('*') {
-            continue;
-        }
-        let mut specs: Vec<&str> = Vec::new();
-        if line.starts_with("import ") || line.starts_with("import\"") || line.starts_with("import'") {
-            if let Some(i) = line.find(" from ") {
-                specs.extend(quoted(&line[i + 6..]));
-            } else {
-                specs.extend(quoted(line));
-            }
-        } else if line.starts_with("export ") {
-            if let Some(i) = line.find(" from ") {
-                specs.extend(quoted(&line[i + 6..]));
-            }
-        }
-        for key in ["require(", "import("] {
-            let mut rest = line;
-            while let Some(i) = rest.find(key) {
-                rest = &rest[i + key.len()..];
-                if let Some(q) = quoted(rest) {
-                    // Only a string literal directly inside the parens.
-                    if rest.trim_start().starts_with(['"', '\'']) {
-                        specs.push(q);
-                    }
-                }
-            }
-        }
-        for s in specs {
-            if is_js_relative(s) {
-                out.push(ImportRef::Relative(s.to_string()));
-            } else {
-                out.push(ImportRef::External(s.to_string()));
-            }
-        }
-    }
-}
-
-fn extract_python(text: &str, out: &mut Vec<ImportRef>) {
-    for raw in text.lines() {
-        let line = raw.trim();
-        if let Some(rest) = line.strip_prefix("from ") {
-            let Some((module, names)) = rest.split_once(" import ") else { continue };
-            let module = module.trim();
-            let levels = module.chars().take_while(|c| *c == '.').count();
-            let segs: Vec<String> = module[levels..].split('.').filter(|s| !s.is_empty()).map(String::from).collect();
-            let names = names
-                .trim()
-                .trim_start_matches('(')
-                .trim_end_matches(')')
-                .split(',')
-                .map(|n| n.trim().split(" as ").next().unwrap_or("").trim().to_string())
-                .filter(|n| !n.is_empty() && n != "*")
-                .collect();
-            out.push(ImportRef::Py { levels, segs, names });
-        } else if let Some(rest) = line.strip_prefix("import ") {
-            for m in rest.split(',') {
-                let m = m.trim().split(" as ").next().unwrap_or("").trim();
-                if !m.is_empty() {
-                    out.push(ImportRef::Py { levels: 0, segs: m.split('.').map(String::from).collect(), names: vec![] });
-                }
-            }
-        }
-    }
-}
-
-fn extract_c(text: &str, out: &mut Vec<ImportRef>) {
-    for raw in text.lines() {
-        let line = raw.trim();
-        if let Some(rest) = line.strip_prefix('#') {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix("include") {
-                let rest = rest.trim_start();
-                if rest.starts_with('"') {
-                    if let Some(q) = quoted(rest) {
-                        out.push(ImportRef::Relative(q.to_string()));
-                    }
-                } else if let Some(rest) = rest.strip_prefix('<') {
-                    if let Some(end) = rest.find('>') {
-                        out.push(ImportRef::External(rest[..end].to_string()));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn extract_go(text: &str, out: &mut Vec<ImportRef>) {
-    let mut in_block = false;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if in_block {
-            if line.starts_with(')') {
-                in_block = false;
-            } else if let Some(q) = quoted(line) {
-                out.push(ImportRef::GoPkg(q.to_string()));
-            }
-        } else if let Some(rest) = line.strip_prefix("import") {
-            let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                in_block = true;
-            } else if let Some(q) = quoted(rest) {
-                out.push(ImportRef::GoPkg(q.to_string()));
-            }
-        }
-    }
-}
-
 fn extract_css(text: &str, out: &mut Vec<ImportRef>) {
     for raw in text.lines() {
         let line = raw.trim();
@@ -305,11 +141,8 @@ fn extract_css(text: &str, out: &mut Vec<ImportRef>) {
 pub fn extract_imports(lang: &str, text: &str) -> Vec<ImportRef> {
     let mut out = Vec::new();
     match lang {
-        "rust" => extract_rust(text, &mut out),
-        "javascript" | "javascriptreact" | "typescript" | "typescriptreact" | "vue" | "svelte" => extract_js(text, &mut out),
-        "python" => extract_python(text, &mut out),
-        "c" | "cpp" => extract_c(text, &mut out),
-        "go" => extract_go(text, &mut out),
+        l if ts_imports::supports(l) => ts_imports::extract(l, text, &mut out),
+        "vue" | "svelte" => ts_imports::extract_script_blocks(text, &mut out),
         "css" | "scss" | "less" => extract_css(text, &mut out),
         _ => {}
     }

@@ -1,4 +1,8 @@
-//! Syntax highlighting with syntect, incremental per line, producing egui `LayoutJob`s.
+//! Syntax highlighting producing egui `LayoutJob`s: tree-sitter for the bundled grammars
+//! (a real parse tree, see `ts`), syntect (regex grammars) for every other language.
+//! Both are incremental and only colour the lines on screen.
+
+pub mod ts;
 
 use std::ops::Range;
 use std::path::Path;
@@ -123,24 +127,19 @@ const WINDOW_BLOCK: usize = 128;
 
 type JobKey = (u64, u64, u32, usize, usize);
 
-/// Per-document highlight cache.
-/// - Parsing is incremental: after an edit only lines from the change onwards are re-parsed,
-///   stopping as soon as the parser state re-converges with the old parse.
-/// - Parsing is lazy: only as far as needed to show the visible lines; the rest of the file is
-///   parsed in small time slices while `needs_more()` is true.
-/// - Colours are computed for the visible window only, so the job handed to egui each frame
-///   has a few hundred sections instead of one per token of the whole file, and a theme
-///   change needs no re-parse.
+/// Per-document highlight cache: the engine for the document's syntax, chosen on first use.
 #[derive(Default)]
 pub struct HlCache {
     syntax: String,
-    text_hash: u64,
-    lines: Vec<Line>,
-    /// State after `lines.last()`, i.e. at the start of the next line to parse.
-    next: Option<(ParseState, ScopeStack)>,
-    total_lines: usize,
-    tail: Option<Tail>,
-    last: Option<(JobKey, LayoutJob)>,
+    engine: Engine,
+}
+
+#[derive(Default)]
+enum Engine {
+    #[default]
+    None,
+    Syntect(SyntectCache),
+    Tree(ts::TsCache),
 }
 
 impl HlCache {
@@ -151,26 +150,76 @@ impl HlCache {
 
     /// True while part of the file still has to be parsed in the background.
     pub fn needs_more(&self) -> bool {
-        self.lines.len() < self.total_lines
+        match &self.engine {
+            Engine::None => false,
+            Engine::Syntect(c) => c.needs_more(),
+            Engine::Tree(c) => c.needs_more(),
+        }
     }
 
     /// Highlight for display. `visible` is the (first, last) visible line from the previous
     /// frame; only lines around it are coloured, the rest uses the plain text colour.
-    pub fn layout_job_window(
-        &mut self,
-        text: &str,
-        syn: &Syntaxes,
-        syntax: &str,
-        theme: &Theme,
-        font: &FontId,
-        visible: Option<(usize, usize)>,
-    ) -> LayoutJob {
+    pub fn layout_job_window(&mut self, text: &str, syn: &Syntaxes, syntax: &str, theme: &Theme, font: &FontId, visible: Option<(usize, usize)>) -> LayoutJob {
         if text.len() > MAX_HIGHLIGHT_BYTES {
             return LayoutJob::simple(text.to_owned(), font.clone(), theme.fg, f32::INFINITY);
         }
-        if syntax != self.syntax {
-            *self = HlCache { syntax: syntax.to_string(), ..Default::default() };
+        if syntax != self.syntax || matches!(self.engine, Engine::None) {
+            self.syntax = syntax.to_string();
+            self.engine = match ts::grammar_for(syntax) {
+                Some(g) => Engine::Tree(ts::TsCache::new(g)),
+                None => Engine::Syntect(SyntectCache { syntax: syntax.to_string(), ..Default::default() }),
+            };
         }
+        match &mut self.engine {
+            Engine::Tree(c) => c.layout_job_window(text, syn.generation, theme, font, visible),
+            Engine::Syntect(c) => c.layout_job_window(text, syn, theme, font, visible),
+            Engine::None => unreachable!(),
+        }
+    }
+
+    #[cfg(test)]
+    fn syntect(&self) -> &SyntectCache {
+        match &self.engine {
+            Engine::Syntect(c) => c,
+            _ => panic!("not a syntect document"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn tree(&self) -> &ts::TsCache {
+        match &self.engine {
+            Engine::Tree(c) => c,
+            _ => panic!("not a tree-sitter document"),
+        }
+    }
+}
+
+/// The syntect engine.
+/// - Parsing is incremental: after an edit only lines from the change onwards are re-parsed,
+///   stopping as soon as the parser state re-converges with the old parse.
+/// - Parsing is lazy: only as far as needed to show the visible lines; the rest of the file is
+///   parsed in small time slices while `needs_more()` is true.
+/// - Colours are computed for the visible window only, so the job handed to egui each frame
+///   has a few hundred sections instead of one per token of the whole file, and a theme
+///   change needs no re-parse.
+#[derive(Default)]
+pub struct SyntectCache {
+    syntax: String,
+    text_hash: u64,
+    lines: Vec<Line>,
+    /// State after `lines.last()`, i.e. at the start of the next line to parse.
+    next: Option<(ParseState, ScopeStack)>,
+    total_lines: usize,
+    tail: Option<Tail>,
+    last: Option<(JobKey, LayoutJob)>,
+}
+
+impl SyntectCache {
+    fn needs_more(&self) -> bool {
+        self.lines.len() < self.total_lines
+    }
+
+    fn layout_job_window(&mut self, text: &str, syn: &Syntaxes, theme: &Theme, font: &FontId, visible: Option<(usize, usize)>) -> LayoutJob {
         let h = hash_str(text);
         let (ws, we) = match visible {
             Some((a, b)) => ((a / WINDOW_BLOCK).saturating_sub(1) * WINDOW_BLOCK, (b / WINDOW_BLOCK + 2) * WINDOW_BLOCK),
@@ -367,17 +416,17 @@ mod window_tests {
     fn window_colours_match_a_full_highlight_and_parsing_is_lazy() {
         let (syn, theme, font) = setup();
         let text = big(20_000);
-        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        let full = HlCache::default().layout_job(&text, &syn, "Java", &theme, &font);
         let mut c = HlCache::default();
-        let job = c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((0, 40)));
+        let job = c.layout_job_window(&text, &syn, "Java", &theme, &font, Some((0, 40)));
         assert!(c.needs_more(), "only the start of the file should be parsed on first show");
-        assert!(c.lines.len() < 20_000);
+        assert!(c.syntect().lines.len() < 20_000);
         let r = line_bytes(&text, 0, 200);
         assert_eq!(in_range(&job, r.clone()), in_range(&full, r));
         assert!(job.sections.len() < 8_000, "window job has {} sections", job.sections.len());
 
         // Jump deep into the file: parsed on demand, and correct.
-        let job = c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((15_000, 15_040)));
+        let job = c.layout_job_window(&text, &syn, "Java", &theme, &font, Some((15_000, 15_040)));
         let r = line_bytes(&text, 14_950, 15_100);
         assert_eq!(in_range(&job, r.clone()), in_range(&full, r));
 
@@ -386,7 +435,7 @@ mod window_tests {
             if !c.needs_more() {
                 break;
             }
-            c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((15_000, 15_040)));
+            c.layout_job_window(&text, &syn, "Java", &theme, &font, Some((15_000, 15_040)));
         }
         assert!(!c.needs_more());
     }
@@ -396,19 +445,19 @@ mod window_tests {
         let (syn, theme, font) = setup();
         let mut text = big(3_000);
         let mut c = HlCache::default();
-        c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((0, 40)));
+        c.layout_job_window(&text, &syn, "Java", &theme, &font, Some((0, 40)));
         // Edit while most of the file is unparsed, then open a comment that changes everything after.
         text.insert(10, 'x');
-        c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((0, 40)));
+        c.layout_job_window(&text, &syn, "Java", &theme, &font, Some((0, 40)));
         let at = text.find("fn f5(").unwrap();
         text.insert_str(at, "/* ");
-        let inc = c.layout_job(&text, &syn, "Rust", &theme, &font);
-        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        let inc = c.layout_job(&text, &syn, "Java", &theme, &font);
+        let full = HlCache::default().layout_job(&text, &syn, "Java", &theme, &font);
         assert_eq!(inc.sections, full.sections);
         // Close it again after a complete parse: re-convergence path.
         text = text.replacen("/* fn f5(", "fn f5(", 1);
-        let inc = c.layout_job(&text, &syn, "Rust", &theme, &font);
-        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        let inc = c.layout_job(&text, &syn, "Java", &theme, &font);
+        let full = HlCache::default().layout_job(&text, &syn, "Java", &theme, &font);
         assert_eq!(inc.sections, full.sections);
     }
 
@@ -417,14 +466,92 @@ mod window_tests {
         let (mut syn, theme, font) = setup();
         let text = big(2_000);
         let mut c = HlCache::default();
-        let a = c.layout_job(&text, &syn, "Rust", &theme, &font);
-        let parsed_ptr = c.lines.as_ptr();
+        let a = c.layout_job(&text, &syn, "Java", &theme, &font);
+        let parsed_ptr = c.syntect().lines.as_ptr();
         let other = crate::theme::by_name("gruvbox");
         syn.set_theme(&other);
-        let b = c.layout_job(&text, &syn, "Rust", &other, &font);
+        let b = c.layout_job(&text, &syn, "Java", &other, &font);
         assert_ne!(a.sections, b.sections);
-        assert_eq!(parsed_ptr, c.lines.as_ptr(), "theme change must not re-parse");
-        assert_eq!(b.sections, HlCache::default().layout_job(&text, &syn, "Rust", &other, &font).sections);
+        assert_eq!(parsed_ptr, c.syntect().lines.as_ptr(), "theme change must not re-parse");
+        assert_eq!(b.sections, HlCache::default().layout_job(&text, &syn, "Java", &other, &font).sections);
+    }
+
+    #[test]
+    fn tree_sitter_window_matches_a_full_highlight_and_parsing_is_sliced() {
+        let (syn, theme, font) = setup();
+        let text = big(20_000);
+        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        let mut c = HlCache::default();
+        let mut job = c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((0, 40)));
+        // A big file is parsed in slices across frames; the text shows plain meanwhile.
+        for _ in 0..10_000 {
+            if !c.needs_more() {
+                break;
+            }
+            job = c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((0, 40)));
+        }
+        assert!(c.tree().parsed());
+        let r = line_bytes(&text, 0, 200);
+        assert_eq!(in_range(&job, r.clone()), in_range(&full, r));
+        assert!(job.sections.len() < 8_000, "window job has {} sections", job.sections.len());
+        let job = c.layout_job_window(&text, &syn, "Rust", &theme, &font, Some((15_000, 15_040)));
+        let r = line_bytes(&text, 14_950, 15_100);
+        assert_eq!(in_range(&job, r.clone()), in_range(&full, r));
+    }
+
+    #[test]
+    fn tree_sitter_edits_are_incremental_and_correct() {
+        let (syn, theme, font) = setup();
+        let mut text = big(3_000);
+        let mut c = HlCache::default();
+        c.layout_job(&text, &syn, "Rust", &theme, &font);
+        assert!(c.tree().parsed());
+        // Open a comment that changes everything after it, then close it again.
+        let at = text.find("fn f5(").unwrap();
+        text.insert_str(at, "/* ");
+        let inc = c.layout_job(&text, &syn, "Rust", &theme, &font);
+        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        assert_eq!(inc.sections, full.sections);
+        text = text.replacen("/* fn f5(", "fn f5(", 1);
+        let inc = c.layout_job(&text, &syn, "Rust", &theme, &font);
+        let full = HlCache::default().layout_job(&text, &syn, "Rust", &theme, &font);
+        assert_eq!(inc.sections, full.sections);
+        // Theme change: new colours, same parse.
+        let other = crate::theme::by_name("gruvbox");
+        let mut syn2 = Syntaxes::new(&theme);
+        syn2.set_theme(&other);
+        let b = c.layout_job(&text, &syn2, "Rust", &other, &font);
+        assert_ne!(b.sections, inc.sections);
+        assert_eq!(b.sections, HlCache::default().layout_job(&text, &syn2, "Rust", &other, &font).sections);
+    }
+
+    #[test]
+    fn tree_sitter_colours_by_syntax_not_by_regex() {
+        let (syn, theme, font) = setup();
+        let colour_of = |lang: &str, text: &str, needle: &str| {
+            let job = HlCache::default().layout_job(text, &syn, lang, &theme, &font);
+            let at = text.find(needle).unwrap();
+            job.sections.iter().find(|s| s.byte_range.start.0 <= at && at < s.byte_range.end.0).map(|s| s.format.color).unwrap()
+        };
+        let rust = "fn main() { let s = \"x\"; foo(s); } // c\nstruct T;\n";
+        assert_eq!(colour_of("Rust", rust, "fn"), theme.purple);
+        assert_eq!(colour_of("Rust", rust, "\"x\""), theme.green);
+        assert_eq!(colour_of("Rust", rust, "// c"), theme.comment);
+        assert_eq!(colour_of("Rust", rust, "main"), theme.blue);
+        assert_eq!(colour_of("Rust", rust, "T;"), theme.yellow);
+        // A keyword inside a string is a string; a call is a function even without a regex hint.
+        let ts = "const fn2 = 'let x';\nfoo.bar(1);\nclass A {}\n";
+        assert_eq!(colour_of("TypeScript", ts, "let x"), theme.green);
+        assert_eq!(colour_of("TypeScript", ts, "bar"), theme.blue);
+        assert_eq!(colour_of("TypeScript", ts, "A {}"), theme.yellow);
+        assert_eq!(colour_of("TypeScript", ts, "const"), theme.purple);
+        assert_eq!(colour_of("TypeScript", "let v: string;", "string"), theme.yellow);
+        let py = "def f(a):\n    return a  # note\n";
+        assert_eq!(colour_of("Python", py, "def"), theme.purple);
+        assert_eq!(colour_of("Python", py, "# note"), theme.comment);
+        // Languages without a bundled grammar still get syntect.
+        let java = "public class A { String s = \"q\"; }";
+        assert_eq!(colour_of("Java", java, "\"q\""), theme.green);
     }
 
     #[test]
@@ -432,8 +559,8 @@ mod window_tests {
         let (syn, theme, font) = setup();
         let text = format!("fn a() {{}}\nlet x = \"{}\";\nfn b() {{}}\n", "y".repeat(50_000));
         let mut c = HlCache::default();
-        let job = c.layout_job(&text, &syn, "Rust", &theme, &font);
-        assert!(c.lines[1].ops.is_empty());
+        let job = c.layout_job(&text, &syn, "Java", &theme, &font);
+        assert!(c.syntect().lines[1].ops.is_empty());
         let end = job.sections.last().unwrap().byte_range.end.0;
         assert_eq!(end, text.len());
     }

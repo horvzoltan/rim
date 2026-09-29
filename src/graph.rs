@@ -9,6 +9,7 @@ use egui::{Pos2, Vec2};
 pub mod describe;
 pub mod layout;
 pub mod scan;
+mod ts_imports;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeKind {
