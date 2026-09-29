@@ -86,6 +86,8 @@ impl H {
                 request_focus,
                 triggers: &self.triggers,
                 vim: if self.vim_on { Some(&mut self.shared) } else { None },
+                breakpoints: &[],
+                exec_line: None,
             };
             self.events.extend(show(ui, &mut self.doc, &mut cx));
         });

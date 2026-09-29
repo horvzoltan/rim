@@ -306,6 +306,15 @@ impl App {
             self.find_bar(ui);
         }
         let Some(i) = self.active else { return };
+        if self.debug_ui.open {
+            let t = self.theme.clone();
+            egui::Panel::bottom("rim_debug")
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(120.0..=700.0)
+                .frame(Frame::NONE.fill(t.bg_dark).inner_margin(Margin::symmetric(8, 4)))
+                .show(ui, |ui| self.debug_panel(ui));
+        }
         let main_server = self.servers_for_doc(i).into_iter().next().map(|s| s.name);
         let uri = self.docs[i].path.as_ref().map(|p| lsp::uri(p));
         let diags: &[Diagnostic] = uri.as_ref().and_then(|u| self.diagnostics.get(u)).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -317,6 +326,13 @@ impl App {
             (self.find.matches.as_slice(), self.find.current.map(|c| self.find.matches[c]))
         } else {
             (&[][..], None)
+        };
+        let doc_path = self.docs[i].path.clone();
+        let breakpoints: Vec<usize> = doc_path.as_ref().map(|p| self.debug.lines_for(p)).unwrap_or_default();
+        let exec_line = if self.debug.phase == crate::debug::Phase::Stopped {
+            self.debug.frames.get(self.debug.frame_sel).filter(|f| f.path.is_some() && f.path == doc_path).map(|f| f.line)
+        } else {
+            None
         };
         let mut cx = EditorCtx {
             theme: &self.theme,
@@ -332,6 +348,8 @@ impl App {
             request_focus: std::mem::take(&mut self.focus_editor) && !self.palette.open && !self.find_files.open,
             triggers,
             vim: if self.cfg.vim_mode { Some(&mut self.vim_shared) } else { None },
+            breakpoints: &breakpoints,
+            exec_line,
         };
         let events = editor::show(ui, &mut self.docs[i], &mut cx);
 
@@ -368,6 +386,10 @@ impl App {
                     }
                     return;
                 }
+                EditorEvent::ToggleBreakpoint(line) => match self.docs[i].path.clone() {
+                    Some(p) => self.debug.toggle_breakpoint(&p, line),
+                    None => self.info("Save the file before setting breakpoints"),
+                },
             }
         }
     }

@@ -269,6 +269,8 @@ pub enum EditorEvent {
     Save,
     SaveClose,
     Close(bool),
+    /// The gutter was clicked on this line (0-based).
+    ToggleBreakpoint(usize),
 }
 
 pub struct EditorCtx<'a> {
@@ -286,6 +288,9 @@ pub struct EditorCtx<'a> {
     pub triggers: &'a [String],
     /// Present when vim motions are enabled.
     pub vim: Option<&'a mut vim::Shared>,
+    /// Breakpoint lines (0-based) and, while stopped in the debugger, the line being executed.
+    pub breakpoints: &'a [usize],
+    pub exec_line: Option<usize>,
 }
 
 impl EditorCtx<'_> {
@@ -864,6 +869,9 @@ pub fn show(ui: &mut Ui, doc: &mut Document, cx: &mut EditorCtx) -> Vec<EditorEv
             0.0,
             theme.bg_highlight,
         )];
+        if let Some(l) = cx.exec_line.filter(|l| (first_vis..=last_vis).contains(l)) {
+            bg.push(Shape::rect_filled(Rect::from_min_size(pos2(clip.left(), row_top(l)), vec2(clip.width(), row_h)), 0.0, theme.yellow.gamma_multiply(0.18)));
+        }
         for &(s, e) in cx.matches {
             let l = doc.index.line_of_char(s.min(doc.index.total_chars));
             if l < first_vis || l > last_vis {
@@ -900,6 +908,30 @@ pub fn show(ui: &mut Ui, doc: &mut Document, cx: &mut EditorCtx) -> Vec<EditorEv
                 num_font.clone(),
                 color,
             );
+        }
+        // Breakpoints and the execution line, at the left edge of the gutter.
+        let bp_x = gutter.left() + char_w * 0.9;
+        for &l in cx.breakpoints {
+            if (first_vis..=last_vis).contains(&l) {
+                painter.circle_filled(pos2(bp_x, row_top(l) + row_h / 2.0), row_h * 0.26, theme.red);
+            }
+        }
+        if let Some(l) = cx.exec_line.filter(|l| (first_vis..=last_vis).contains(l)) {
+            let (x, y) = (bp_x - row_h * 0.22, row_top(l) + row_h / 2.0);
+            painter.add(Shape::convex_polygon(
+                vec![pos2(x, y - row_h * 0.3), pos2(x + row_h * 0.5, y), pos2(x, y + row_h * 0.3)],
+                theme.yellow,
+                Stroke::new(1.0, theme.bg),
+            ));
+        }
+        let gutter_resp = ui.interact(gutter, id.with("gutter"), Sense::click());
+        if gutter_resp.clicked()
+            && let Some(p) = gutter_resp.interact_pointer_pos()
+        {
+            let line = galley.rows.partition_point(|r| gpos.y + r.rect().max.y <= p.y);
+            if line < lines {
+                events.push(EditorEvent::ToggleBreakpoint(line));
+            }
         }
         let mark_x = gutter.right() - char_w * 0.9;
         for &(s, e, kind) in &doc.marks {
@@ -1231,6 +1263,8 @@ mod tests {
                     request_focus,
                     triggers: &[],
                     vim: if self.vim_on { Some(&mut self.shared) } else { None },
+                    breakpoints: &[],
+                    exec_line: None,
                 };
                 self.events.extend(show(ui, &mut self.doc, &mut cx));
             });

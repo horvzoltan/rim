@@ -1085,3 +1085,46 @@ fn status_bar_suggests_a_server_and_opens_the_manager() {
     h.key(Key::Escape);
     assert!(h.app.dialog.is_none());
 }
+
+#[test]
+fn debugging_with_breakpoints_stepping_and_the_panel() {
+    let root = scratch("debug");
+    let file = write(&root, "src/main.rs", "fn main() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n    println!(\"{}\", x + y + z);\n}\n");
+    let adapter = crate::dap::tests::fake_adapter(&root.join("tools"));
+    let mut h = H::new(&root, |_| {});
+    h.app.open_path(&file);
+    h.frame(vec![]);
+    // F9 puts a breakpoint on the cursor's line; toggling again removes it.
+    h.app.open_at(&file, 2, 0, 0);
+    h.frame(vec![]);
+    h.key(Key::F9);
+    assert_eq!(h.app.debug.lines_for(&file), [2]);
+    h.key(Key::F9);
+    assert!(h.app.debug.lines_for(&file).is_empty());
+    h.key(Key::F9);
+    // F5 without a configuration opens the configuration window instead of starting.
+    h.key(Key::F5);
+    assert!(h.app.debug_ui.config_open && h.app.debug.phase == crate::debug::Phase::Idle);
+    h.frame(vec![]);
+    h.app.debug_ui.config_open = false;
+    h.app.debug.config = crate::debug::LaunchConfig { kind: crate::debug::Kind::Custom, command: vec![adapter.display().to_string()], program: "prog".into(), ..Default::default() };
+    h.key(Key::F5);
+    assert!(h.app.debug_ui.open, "the panel opens when debugging starts");
+    h.until("stopped at the breakpoint", |a| a.debug.phase == crate::debug::Phase::Stopped && a.debug.scopes.first().is_some_and(|s| s.vars.is_some()));
+    // The execution line is revealed in the editor and drawn with the panel.
+    assert_eq!(h.doc().path.as_deref(), Some(file.as_path()));
+    assert_eq!(h.doc().line_col().0, 2);
+    h.frame(vec![]);
+    assert_eq!(h.app.debug.frames[0].line, 2);
+    // Step over moves the execution line; Continue finishes the program.
+    h.key(Key::F10);
+    h.until("stepped", |a| a.debug.phase == crate::debug::Phase::Stopped && a.debug.frames.first().is_some_and(|f| f.line == 3));
+    assert_eq!(h.doc().line_col().0, 3);
+    h.key(Key::F5);
+    h.until("ended", |a| a.debug.phase == crate::debug::Phase::Ended);
+    assert!(h.app.debug.console.iter().any(|l| l.text == "done"));
+    // Shift+F5 while idle is harmless; the breakpoints were saved with the project.
+    h.key_m(Key::F5, Modifiers::SHIFT);
+    assert!(std::fs::read_to_string(root.join(".rim/debug.toml")).unwrap().contains("[breakpoints]"));
+    let _ = std::fs::remove_dir_all(&root);
+}

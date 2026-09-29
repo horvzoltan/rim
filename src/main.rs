@@ -2,6 +2,8 @@ mod app;
 mod chat;
 mod claude;
 mod config;
+mod dap;
+mod debug;
 mod editor;
 mod file_icons;
 mod format;

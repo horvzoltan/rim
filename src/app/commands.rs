@@ -48,11 +48,22 @@ pub(super) enum Cmd {
     QuickOpen,
     NextTab,
     PrevTab,
+    DebugStart,
+    DebugStop,
+    DebugStepOver,
+    DebugStepInto,
+    DebugStepOut,
+    DebugPause,
+    DebugToggleBreakpoint,
+    DebugPanel,
+    DebugConfigure,
 }
 
 const C: Modifiers = Modifiers::COMMAND;
 const CS: Modifiers = Modifiers { shift: true, ..Modifiers::COMMAND };
 const AS: Modifiers = Modifiers { alt: true, shift: true, ..Modifiers::NONE };
+const N: Modifiers = Modifiers::NONE;
+const SH: Modifiers = Modifiers::SHIFT;
 
 struct CmdInfo {
     cmd: Cmd,
@@ -81,6 +92,16 @@ cmds![
     (PrevTab, "prev_tab", "", "Ctrl+Shift+Tab", [CS + Tab, C + PageUp]),
     (Format, "format", "Format Document", "Shift+Alt+F", [AS + F]),
     (QuickOpen, "quick_open", "", "Ctrl+P", [C + P]),
+    // Shift+F5 / Shift+F11 before the plain keys (extra Shift is ignored when matching).
+    (DebugStop, "debug_stop", "Debug: Stop", "Shift+F5", [SH + F5]),
+    (DebugStepOut, "debug_step_out", "Debug: Step Out", "Shift+F11", [SH + F11]),
+    (DebugStart, "debug_start", "Debug: Start / Continue", "F5", [N + F5]),
+    (DebugStepOver, "debug_step_over", "Debug: Step Over", "F10", [N + F10]),
+    (DebugStepInto, "debug_step_into", "Debug: Step Into", "F11", [N + F11]),
+    (DebugToggleBreakpoint, "debug_breakpoint", "Debug: Toggle Breakpoint", "F9", [N + F9]),
+    (DebugPause, "debug_pause", "Debug: Pause", "", []),
+    (DebugPanel, "debug_panel", "View: Debug Panel", "", []),
+    (DebugConfigure, "debug_configure", "Debug: Configure…", "", []),
     (Find, "find", "Find in File", "Ctrl+F", [C + F]),
     (GotoLine, "goto", "Go to Line…", "Ctrl+G", [C + G]),
     (QuickFix, "quick_fix", "Quick Fix… (Auto-Import, Fix Problem)", "Ctrl+.", [C + Period]),
@@ -137,6 +158,15 @@ impl App {
         match cmd {
             Cmd::ProjectGraph => self.toggle_graph(),
             Cmd::QuickFix => self.quick_fix(),
+            Cmd::DebugStart => self.debug_start(),
+            Cmd::DebugStop => self.debug.stop(),
+            Cmd::DebugStepOver => self.debug.step_over(),
+            Cmd::DebugStepInto => self.debug.step_into(),
+            Cmd::DebugStepOut => self.debug.step_out(),
+            Cmd::DebugPause => self.debug.pause(),
+            Cmd::DebugToggleBreakpoint => self.toggle_breakpoint_here(),
+            Cmd::DebugPanel => self.debug_ui.open = !self.debug_ui.open,
+            Cmd::DebugConfigure => self.debug_configure(),
             Cmd::GraphDescribeAll => {
                 if !self.show_graph {
                     self.toggle_graph();

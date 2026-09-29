@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::chat::{self, Chat, ChatAction, ContextInfo, Selection};
 use crate::claude;
 use crate::config::{self, Config};
+use crate::debug::Debugger;
 use crate::editor::{self, Completion, Document, EditorCtx, EditorEvent, Hover};
 use crate::format;
 use crate::git::{self, FileStatus, Repo};
@@ -29,6 +30,7 @@ use crate::vim;
 mod claude_glue;
 mod code_actions;
 mod commands;
+mod debug_ui;
 mod dialogs;
 mod find_files;
 mod git_glue;
@@ -41,6 +43,7 @@ mod util;
 
 use code_actions::QuickFix;
 use commands::Cmd;
+use debug_ui::DebugUi;
 use find_files::FindFiles;
 use graph_ui::GraphState;
 use lsp_manager::LspManager;
@@ -204,6 +207,8 @@ pub struct App {
     /// The project graph replaces the editor area while shown.
     show_graph: bool,
     graph: GraphState,
+    debug: Debugger,
+    debug_ui: DebugUi,
     dialog: Option<Dialog>,
     toasts: Vec<Toast>,
     tasks_tx: Sender<Task>,
@@ -263,7 +268,11 @@ impl App {
         let (tasks_tx, tasks_rx) = channel();
         let syn = Syntaxes::new(&theme);
         let chat = Chat::new(&cfg.claude);
+        let mut debug = Debugger::new(Some(cc.egui_ctx.clone()));
+        debug.load(&root);
         let mut app = Self {
+            debug,
+            debug_ui: DebugUi::default(),
             tree: FileTree::new(root.clone()),
             cfg,
             theme,
@@ -325,6 +334,14 @@ impl App {
         if std::env::var_os("RIM_GRAPH_DEMO").is_some() {
             app.toggle_graph();
         }
+        // `RIM_DEBUG_DEMO=1`: open the first file with breakpoints and start debugging.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("RIM_DEBUG_DEMO").is_some() {
+            if let Some(p) = app.debug.breakpoints.keys().next().cloned() {
+                app.open_path(&p);
+            }
+            app.debug_start();
+        }
         if let Some(f) = file {
             app.open_path(&f);
         }
@@ -377,6 +394,8 @@ impl App {
         self.repo = Repo::discover(&root);
         self.find_files = FindFiles::default();
         self.graph = GraphState::default();
+        self.debug.load(&root);
+        self.debug_ui = DebugUi::default();
         self.file_list = None;
         self.chat.reset();
         if let Some(dir) = config::state_file().parent() {
@@ -684,6 +703,7 @@ impl eframe::App for App {
         self.poll_tasks();
         self.poll_lsp();
         self.poll_claude();
+        self.poll_debug();
         self.periodic();
         if self.refocus_frames > 0 && self.dialog.is_none() {
             self.refocus_frames -= 1;
@@ -701,6 +721,7 @@ impl eframe::App for App {
         if self.dialog.is_none() {
             self.shortcuts();
         }
+        self.debug_config_window();
 
         let t = self.theme.clone();
         egui::Panel::bottom("status")
