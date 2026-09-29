@@ -111,8 +111,10 @@ background to pan, drag a circle to move it, click one to see what it is, double
 ## Claude
 `Ctrl+L` opens the Claude panel (and moves focus between chat and editor). It drives the local **Claude Code** CLI, so your login,
 models, `CLAUDE.md`, MCP servers, skills and permission rules work exactly as they do in a terminal.
-- **Setup:** install Claude Code; rim finds it on `PATH`, in the usual install locations, or in the VS Code extension's bundled copy
-  (override with `[claude] path = "…"`). If you are already signed in from VS Code or a terminal, rim uses that login.
+- **Setup:** rim finds Claude Code on `PATH`, in the usual install locations, or in the VS Code extension's bundled copy
+  (override with `[claude] path = "…"`). When it is missing, or only the extension's copy is there (that path changes with
+  every extension update), the panel offers *Install Claude Code*, which runs the official installer into `~/.local/bin`.
+  If you are already signed in from VS Code or a terminal, rim uses that login.
 - **Signing in:** if you are signed out, the panel shows a Sign in banner: it opens your browser, you paste the code the page shows,
   and you're in. The Account menu shows who is signed in and has Sign out (which also signs out VS Code and terminals).
 - **Context:** your open file and selection are shared with each prompt (untick the box under the prompt to stop). `@` mentions a file.
@@ -126,7 +128,9 @@ models, `CLAUDE.md`, MCP servers, skills and permission rules work exactly as th
   (On Wayland, pasting reads the clipboard with `wl-paste` from the wl-clipboard package.)
 - **Also:** Esc stops a running turn, History resumes earlier conversations, files Claude changes reload in the editor,
   `⋯ → Export conversation` saves the chat as text, and `⋯ → Account & usage` shows your plan's limits and this session's cost.
-- **Not yet:** slash commands, MCP/`/` menus, and Claude's own diff-review tab inside the editor.
+- **Slash commands:** type `/` for the list Claude Code reports (built-ins like `/compact` and `/review`, your skills,
+  plugins); arrows pick, Tab or Enter completes, and the message is sent as typed so the CLI runs it.
+- **Not yet:** MCP management menus and Claude's own diff-review tab inside the editor.
 
 ## Development
     cargo test                                   # ~200 tests, headless (no window needed)

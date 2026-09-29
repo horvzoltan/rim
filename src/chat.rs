@@ -138,7 +138,7 @@ fn is_image_file(p: &Path) -> bool {
     matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp"))
 }
 
-const NOT_FOUND: &str = "Claude Code was not found. Install it (`npm install -g @anthropic-ai/claude-code`, or the installer from claude.com/claude-code), then reopen this panel and use Sign in. You can also set `claude.path` in config.toml.";
+const NOT_FOUND: &str = "Claude Code was not found. Install it with the button below (or `npm install -g @anthropic-ai/claude-code`), then use Sign in. You can also set `claude.path` in config.toml.";
 
 #[derive(Default, Clone)]
 pub struct Selection {
@@ -276,6 +276,8 @@ pub struct Chat {
     info_requested: bool,
     /// Where the session runs (for saving exports next to the project).
     session_root: PathBuf,
+    /// The standalone installer running in the background.
+    installing: Option<Receiver<Result<PathBuf, String>>>,
 }
 
 const INPUT_ID: &str = "rim-chat-input";
@@ -310,6 +312,7 @@ impl Chat {
             info_open: false,
             info_requested: false,
             session_root: PathBuf::new(),
+            installing: None,
         }
     }
 
@@ -542,6 +545,19 @@ impl Chat {
     pub fn poll(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
         self.poll_auth();
+        if let Some(rx) = &self.installing
+            && let Ok(r) = rx.try_recv()
+        {
+            self.installing = None;
+            match r {
+                Ok(p) => {
+                    self.convo.notice(format!("Installed Claude Code at {}. New conversations use it.", p.display()), false);
+                    self.bin = Some(p);
+                    self.auth.checked_once = false;
+                }
+                Err(e) => self.convo.notice(format!("Couldn't install Claude Code: {e}"), true),
+            }
+        }
         self.retiring.retain_mut(|(s, since)| {
             let done = s.poll().iter().any(|m| m["type"] == "result");
             !(done || s.exited || since.elapsed().as_secs() > 8)
@@ -651,6 +667,47 @@ impl Chat {
             });
             self.auth.checked_once = false;
         }
+    }
+
+    /// Run the official installer in the background; the panel switches to the new copy when done.
+    pub fn install_standalone(&mut self, ctx: &egui::Context) {
+        if self.installing.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(claude::install_standalone());
+            ctx.request_repaint();
+        });
+        self.installing = Some(rx);
+    }
+
+    /// A note about where the CLI comes from, with a way to install a standalone copy when it
+    /// is missing or borrowed from an editor extension (whose path changes on every update).
+    fn setup_note(&mut self, ui: &mut Ui, env: &Env) {
+        let t = env.theme;
+        let extension = self.bin.as_deref().is_some_and(claude::is_extension_copy);
+        if self.bin.is_some() && !extension {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            if extension {
+                ui.add(Label::new(RichText::new("Using the copy bundled with the VS Code extension; it moves on every extension update.").size(12.0).color(t.comment)).wrap());
+            }
+            if self.installing.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Installing Claude Code…").size(12.0).color(t.comment));
+                });
+            } else {
+                let label = if extension { "Install a standalone copy" } else { "Install Claude Code" };
+                if ui.button(label).on_hover_text("Runs the official installer (curl -fsSL https://claude.ai/install.sh | bash), which puts claude in ~/.local/bin").clicked() {
+                    self.install_standalone(&ui.ctx().clone());
+                }
+            }
+        });
     }
 
     pub fn start_login(&mut self, ctx: &egui::Context, console: bool) {
@@ -859,6 +916,7 @@ impl Chat {
                 ui.set_width(ui.available_width());
                 if self.convo.items.is_empty() {
                     empty_state(ui, env, self.bin.is_some());
+                    self.setup_note(ui, env);
                 }
                 items_ui(ui, &self.convo.items, self.convo.busy, &mut self.view, env, &mut events);
                 if self.convo.busy && !self.convo.has_pending() {
@@ -957,6 +1015,11 @@ impl Chat {
                     }
                 });
             }
+            ui.add_space(6.0);
+            if let Some(b) = &self.bin {
+                ui.label(RichText::new(format!("Claude Code: {}", b.display())).size(11.5).color(t.comment));
+            }
+            self.setup_note(ui, env);
             ui.add_space(6.0);
             if ui.button("Refresh").clicked() {
                 refresh = true;

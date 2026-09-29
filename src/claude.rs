@@ -55,6 +55,27 @@ pub fn find_binary(configured: Option<&str>) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// True for the copy bundled with an editor extension: it moves with every extension update.
+pub fn is_extension_copy(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "native-binary") && p.to_string_lossy().contains("anthropic.claude-code")
+}
+
+/// Install a standalone Claude Code with the official installer (into `~/.local/bin`).
+/// Blocks for the download; run it on a thread.
+pub fn install_standalone() -> Result<PathBuf, String> {
+    let out = Command::new("bash")
+        .args(["-c", "curl -fsSL https://claude.ai/install.sh | bash"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("couldn't run bash: {e}"))?;
+    if !out.status.success() {
+        let text = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = text.lines().rev().filter(|l| !l.trim().is_empty()).take(3).collect();
+        return Err(format!("the installer failed: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" / ")));
+    }
+    find_binary(None).filter(|p| !is_extension_copy(p)).ok_or_else(|| "the installer finished, but no standalone claude was found".to_string())
+}
+
 // ---------- account ----------
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1289,6 +1310,13 @@ pub mod tests {
         assert_eq!(t.result.as_ref().unwrap().text, "data");
         assert_eq!(c.items.len(), 3);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn extension_copies_are_recognized() {
+        assert!(is_extension_copy(Path::new("/h/.vscode/extensions/anthropic.claude-code-2.1.284-linux-x64/resources/native-binary/claude")));
+        assert!(!is_extension_copy(Path::new("/h/.local/bin/claude")));
+        assert!(!is_extension_copy(Path::new("/usr/bin/claude")));
     }
 
     #[test]
