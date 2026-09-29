@@ -1620,6 +1620,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2828,10 +2830,13 @@ name = "rim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
+ "base64",
  "dirs",
  "eframe",
  "egui",
  "ignore",
+ "image",
  "rfd",
  "serde",
  "serde_json",

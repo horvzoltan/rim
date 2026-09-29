@@ -186,7 +186,8 @@ fn streaming_then_allow_by_clicking_the_button() {
     assert_eq!(last_text(&p.chat).as_deref(), Some("Done."));
     // What the CLI received: the prompt with the IDE context note, and an allow response.
     let sent = log(&dir, "stdin.log");
-    let first = sent[0]["message"]["content"][0]["text"].as_str().unwrap();
+    // (The very first line is the `initialize` handshake.)
+    let first = sent.iter().find(|m| m["type"] == "user").unwrap()["message"]["content"][0]["text"].as_str().unwrap();
     assert!(first.contains("<ide_opened_file>") && first.contains("<ide_selection>") && first.ends_with("hello there"), "{first}");
     let resp = sent.iter().find(|m| m["type"] == "control_response").unwrap();
     assert_eq!(resp["response"]["request_id"], "q1");
@@ -323,7 +324,7 @@ fn markdown_rendering_edge_cases_do_not_panic() {
     ];
     for (i, n) in nasty.iter().enumerate() {
         let _ = md::parse(n);
-        p.chat.convo.items = vec![Item::Text(n.to_string()), Item::Thinking(n.to_string()), Item::User { text: n.to_string(), context: None }];
+        p.chat.convo.items = vec![Item::Text(n.to_string()), Item::Thinking(n.to_string()), Item::User { text: n.to_string(), context: None, images: vec![] }];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.frame(vec![])));
         assert!(r.is_ok(), "panic rendering markdown case {i}: {n:?}");
     }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -84,6 +84,58 @@ pub fn auth_status(bin: &Path) -> Option<AuthStatus> {
 pub fn auth_logout(bin: &Path) -> Result<(), String> {
     let out = Command::new(bin).args(["auth", "logout"]).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
     if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}
+
+/// Whether this CLI has `--tools` (newer versions), which lets a one-shot question run with
+/// no tools at all. Checked once per process.
+fn supports_tools_flag(bin: &Path) -> bool {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&v) = cache.lock().unwrap().get(bin) {
+        return v;
+    }
+    let help = Command::new(bin).arg("--help").stdin(Stdio::null()).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let v = help.contains("--tools");
+    cache.lock().unwrap().insert(bin.to_path_buf(), v);
+    v
+}
+
+/// The arguments for a one-shot, tool-less question (`claude -p`, prompt on stdin).
+pub fn ask_once_args(model: Option<&str>, tools_flag: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["-p", "--output-format", "text", "--max-turns", "1"].iter().map(|s| s.to_string()).collect();
+    if tools_flag {
+        args.extend(["--tools".to_string(), String::new()]);
+    }
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        args.extend(["--model".to_string(), m.to_string()]);
+    }
+    args
+}
+
+/// Ask the CLI one question headlessly and return its plain-text answer. Blocks: call it
+/// from a worker thread. The prompt goes in on stdin, so its length does not matter.
+pub fn ask_once(bin: &Path, cwd: &Path, prompt: &str, model: Option<&str>, timeout: Duration) -> Result<String, String> {
+    let args = ask_once_args(model, supports_tools_flag(bin));
+    let mut child = Command::new(bin)
+        .args(&args)
+        .current_dir(cwd)
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start claude: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    let out = crate::format::wait_with_timeout(child, timeout)?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || text.is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim().lines().last().unwrap_or("").to_string();
+        return Err(if err.is_empty() { format!("claude exited with {}", out.status) } else { err });
+    }
+    Ok(text)
 }
 
 fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<String>>, ctx: egui::Context) -> std::thread::JoinHandle<()> {
@@ -166,6 +218,270 @@ pub struct Options {
     pub model: Option<String>,
     pub permission_mode: String,
     pub resume: Option<String>,
+    pub settings: SessionSettings,
+}
+
+/// Per-session choices the CLI takes at launch (`--effort`, `--settings`). Changing one means
+/// restarting the session, resuming the conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSettings {
+    /// `low`, `medium`, `high`, `xhigh` or `max`; the model's default when empty.
+    pub effort: Option<String>,
+    pub fast_mode: bool,
+    /// Extended thinking; `false` disables it (`alwaysThinkingEnabled: false`).
+    pub thinking: bool,
+    /// An output style name from the CLI's list; `default` when empty.
+    pub output_style: Option<String>,
+    /// Continue on another model when a message is flagged, instead of asking each time.
+    pub switch_models_on_flag: Option<bool>,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self { effort: None, fast_mode: false, thinking: true, output_style: None, switch_models_on_flag: None }
+    }
+}
+
+impl SessionSettings {
+    /// The `--settings` JSON for these choices; `None` when everything is at its default.
+    pub fn settings_json(&self) -> Option<Value> {
+        let mut o = serde_json::Map::new();
+        if self.fast_mode {
+            o.insert("fastMode".into(), json!(true));
+        }
+        if !self.thinking {
+            o.insert("alwaysThinkingEnabled".into(), json!(false));
+        }
+        if let Some(st) = self.output_style.as_deref().filter(|s| !s.is_empty() && *s != "default") {
+            o.insert("outputStyle".into(), json!(st));
+        }
+        if let Some(b) = self.switch_models_on_flag {
+            o.insert("switchModelsOnFlag".into(), json!(b));
+        }
+        (!o.is_empty()).then_some(Value::Object(o))
+    }
+
+    /// Extra command-line arguments for `claude`.
+    pub fn args(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        if let Some(e) = self.effort.as_deref().filter(|e| !e.is_empty()) {
+            a.extend(["--effort".to_string(), e.to_string()]);
+        }
+        if let Some(j) = self.settings_json() {
+            a.extend(["--settings".to_string(), j.to_string()]);
+        }
+        a
+    }
+}
+
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// A selectable model, from the CLI's catalog (the `initialize` reply).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelInfo {
+    /// The value for `--model` / `set_model`; `None` is the CLI's default.
+    pub value: Option<String>,
+    pub label: String,
+    pub description: String,
+    pub effort_levels: Vec<String>,
+    pub fast_mode: bool,
+    pub disabled: bool,
+}
+
+pub fn parse_models(v: &Value) -> Vec<ModelInfo> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let value = m["value"].as_str()?;
+                    let label = m["displayName"].as_str().filter(|s| !s.is_empty()).unwrap_or(value).to_string();
+                    Some(ModelInfo {
+                        value: (value != "default").then(|| value.to_string()),
+                        label,
+                        description: m["description"].as_str().unwrap_or("").to_string(),
+                        effort_levels: m["supportedEffortLevels"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+                        fast_mode: m["supportsFastMode"].as_bool().unwrap_or(false),
+                        disabled: m["disabled"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Who is signed in, from the `initialize` reply.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountInfo {
+    pub email: Option<String>,
+    pub organization: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// What `initialize` told us about this session.
+#[derive(Clone, Debug, Default)]
+pub struct SessionInit {
+    pub models: Vec<ModelInfo>,
+    pub output_styles: Vec<String>,
+    pub account: AccountInfo,
+    /// Slash commands (built-in, skills, plugins) the CLI accepts in a message.
+    pub commands: Vec<SlashCommand>,
+}
+
+/// A slash command as the CLI lists it in the `initialize` reply.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: String,
+    /// The argument placeholder, e.g. `[on|off]`.
+    pub hint: String,
+    pub aliases: Vec<String>,
+}
+
+impl SlashCommand {
+    /// The command's first line of help, short enough for one row.
+    pub fn summary(&self) -> String {
+        let line = self.description.lines().next().unwrap_or("").trim();
+        let mut out: String = line.chars().take(90).collect();
+        if out.len() < line.len() {
+            out.push('…');
+        }
+        out
+    }
+}
+
+pub fn parse_commands(v: &Value) -> Vec<SlashCommand> {
+    let strings = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let name = c["name"].as_str()?.to_string();
+                    // Internal hooks for server-launched sessions, not for typing.
+                    if name.starts_with("__") {
+                        return None;
+                    }
+                    Some(SlashCommand {
+                        name,
+                        description: c["description"].as_str().unwrap_or("").to_string(),
+                        hint: c["argumentHint"].as_str().unwrap_or("").to_string(),
+                        aliases: strings(&c["aliases"]),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn parse_init(v: &Value) -> SessionInit {
+    SessionInit {
+        models: parse_models(&v["models"]),
+        output_styles: v["available_output_styles"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+        account: AccountInfo {
+            email: v["account"]["email"].as_str().map(String::from),
+            organization: v["account"]["organization"].as_str().map(String::from),
+            plan: v["account"]["subscriptionType"].as_str().map(String::from),
+        },
+        commands: parse_commands(&v["commands"]),
+    }
+}
+
+/// One usage meter from `get_usage` (the server's rows, shown as sent).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageRow {
+    pub label: String,
+    pub percent: f32,
+    pub resets_at: Option<String>,
+    pub severity: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub rows: Vec<UsageRow>,
+    pub session_cost_usd: Option<f64>,
+    pub plan: Option<String>,
+}
+
+pub fn parse_usage(v: &Value) -> Usage {
+    // The server's meter rows (`rate_limits.limits`), named by kind.
+    let rows = v["rate_limits"]["limits"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    let percent = r["percent"].as_f64()?;
+                    let kind = r["kind"].as_str().unwrap_or("");
+                    let scope = r["scope"]["model"]["display_name"].as_str().or_else(|| r["scope"]["surface"]["display_name"].as_str());
+                    let label = match (kind, scope) {
+                        ("session", _) => "Current session (5 hours)".to_string(),
+                        ("weekly_all", _) => "This week (all models)".to_string(),
+                        (_, Some(sc)) if kind.starts_with("weekly") => format!("This week ({sc})"),
+                        (_, Some(sc)) => format!("{} ({sc})", r["label"].as_str().unwrap_or(kind)),
+                        (_, None) => r["label"].as_str().unwrap_or(kind).to_string(),
+                    };
+                    Some(UsageRow {
+                        label,
+                        percent: percent as f32,
+                        resets_at: r["resets_at"].as_str().map(String::from),
+                        severity: r["severity"].as_str().unwrap_or("normal").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Usage { rows, session_cost_usd: v["session"]["total_cost_usd"].as_f64(), plan: v["subscription_type"].as_str().map(String::from) }
+}
+
+/// `get_status`: the terminal's /status screen as sections of (label, value) rows.
+pub fn parse_status(v: &Value) -> Vec<(String, Vec<(String, String)>)> {
+    v["sections"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|sec| {
+                    let rows = sec["rows"]
+                        .as_array()
+                        .map(|r| r.iter().map(|x| (x["label"].as_str().unwrap_or("").to_string(), x["value"].as_str().unwrap_or("").to_string())).collect())
+                        .unwrap_or_default();
+                    (sec["title"].as_str().unwrap_or("").to_string(), rows)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A picture attached to a prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageData {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl ImageData {
+    pub fn block(&self) -> Value {
+        use base64::Engine;
+        json!({ "type": "image", "source": { "type": "base64", "media_type": self.media_type, "data": base64::engine::general_purpose::STANDARD.encode(&self.bytes) } })
+    }
+}
+
+/// What a control request was for, so its reply can be routed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    Initialize,
+    Usage,
+    Status,
+    Export,
+    Other,
+}
+
+/// A server's answer to one of our control requests.
+pub enum Reply {
+    Init(SessionInit),
+    Usage(Usage),
+    Status(Vec<(String, Vec<(String, String)>)>),
+    /// The conversation as text, and the file name /export would offer.
+    Export { text: String, filename: String },
+    Error(Control, String),
 }
 
 pub struct Session {
@@ -175,6 +491,8 @@ pub struct Session {
     stderr: Arc<Mutex<Vec<String>>>,
     next_req: u64,
     pub exited: bool,
+    /// Our control requests waiting for an answer, by request id.
+    pending: HashMap<String, Control>,
 }
 
 impl Session {
@@ -199,6 +517,7 @@ impl Session {
         if let Some(id) = &opts.resume {
             cmd.args(["--resume", id]);
         }
+        cmd.args(opts.settings.args());
         let mut child = cmd
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -253,33 +572,76 @@ impl Session {
             }
         });
 
-        Ok(Session { child, tx, rx, stderr: stderr_buf, next_req: 1, exited: false })
+        let mut s = Session { child, tx, rx, stderr: stderr_buf, next_req: 1, exited: false, pending: HashMap::new() };
+        // Like the SDK: the handshake's reply lists the models, output styles and account.
+        s.control(json!({ "subtype": "initialize" }), Control::Initialize);
+        Ok(s)
     }
 
     fn write(&self, v: &Value) {
         let _ = self.tx.send(v.to_string());
     }
 
-    pub fn send_user(&self, text: &str) {
-        self.write(&json!({ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }));
+    /// A prompt, with any pictures first and the text last.
+    pub fn send_user_with(&self, text: &str, images: &[ImageData]) {
+        self.write(&user_message(text, images));
     }
 
-    fn control(&mut self, request: Value) {
+    fn control(&mut self, request: Value, kind: Control) {
         let id = format!("rim-{}", self.next_req);
         self.next_req += 1;
+        self.pending.insert(id.clone(), kind);
         self.write(&json!({ "type": "control_request", "request_id": id, "request": request }));
     }
 
     pub fn interrupt(&mut self) {
-        self.control(json!({ "subtype": "interrupt" }));
+        self.control(json!({ "subtype": "interrupt" }), Control::Other);
     }
 
     pub fn set_permission_mode(&mut self, mode: &str) {
-        self.control(json!({ "subtype": "set_permission_mode", "mode": mode }));
+        self.control(json!({ "subtype": "set_permission_mode", "mode": mode }), Control::Other);
     }
 
     pub fn set_model(&mut self, model: &str) {
-        self.control(json!({ "subtype": "set_model", "model": model }));
+        self.control(json!({ "subtype": "set_model", "model": model }), Control::Other);
+    }
+
+    /// Ask for the plan's usage meters and this session's cost.
+    pub fn request_usage(&mut self) {
+        self.control(json!({ "subtype": "get_usage", "skip_behaviors": true }), Control::Usage);
+    }
+
+    /// Ask for the /status rows (version, account, model, servers…).
+    pub fn request_status(&mut self) {
+        self.control(json!({ "subtype": "get_status" }), Control::Status);
+    }
+
+    /// Ask for the conversation as text, as /export writes it.
+    pub fn request_export(&mut self) {
+        self.control(json!({ "subtype": "export_conversation" }), Control::Export);
+    }
+
+    /// If `msg` answers one of our control requests, the parsed answer.
+    pub fn reply(&mut self, msg: &Value) -> Option<Reply> {
+        if msg["type"] != "control_response" {
+            return None;
+        }
+        let r = &msg["response"];
+        let kind = self.pending.remove(r["request_id"].as_str()?)?;
+        if kind == Control::Other {
+            return None;
+        }
+        if r["subtype"] == "error" {
+            return Some(Reply::Error(kind, r["error"].as_str().unwrap_or("error").to_string()));
+        }
+        let v = &r["response"];
+        Some(match kind {
+            Control::Initialize => Reply::Init(parse_init(v)),
+            Control::Usage => Reply::Usage(parse_usage(v)),
+            Control::Status => Reply::Status(parse_status(v)),
+            Control::Export => Reply::Export { text: v["text"].as_str().unwrap_or("").to_string(), filename: v["default_filename"].as_str().unwrap_or("conversation.txt").to_string() },
+            Control::Other => return None,
+        })
     }
 
     /// Answer a `can_use_tool` request.
@@ -315,6 +677,13 @@ impl Drop for Session {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The stream-json line for a user turn.
+pub fn user_message(text: &str, images: &[ImageData]) -> Value {
+    let mut content: Vec<Value> = images.iter().map(ImageData::block).collect();
+    content.push(json!({ "type": "text", "text": text }));
+    json!({ "type": "user", "message": { "role": "user", "content": content } })
 }
 
 // ---------- conversation model ----------
@@ -370,9 +739,25 @@ impl Tool {
     }
 }
 
+/// A picture the user sent, for the transcript view.
+#[derive(Clone)]
+pub struct UserImage {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    /// A thumbnail, for images attached in this run (not for ones read back from a transcript).
+    pub texture: Option<egui::TextureHandle>,
+}
+
+impl std::fmt::Debug for UserImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserImage({} {}x{})", self.name, self.width, self.height)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Item {
-    User { text: String, context: Option<String> },
+    User { text: String, context: Option<String>, images: Vec<UserImage> },
     Text(String),
     Thinking(String),
     Tool(Tool),
@@ -400,6 +785,8 @@ pub struct Conversation {
     pub status: String,
     pub usage_5h: Option<f32>,
     pub usage_7d: Option<f32>,
+    /// Slash commands whose UI only works in the terminal (from the session's init message).
+    pub terminal_only: Vec<String>,
     streamed: HashSet<String>,
     blocks: HashMap<usize, usize>,
 }
@@ -485,6 +872,9 @@ impl Conversation {
                 Some("init") => {
                     self.session_id = msg["session_id"].as_str().map(String::from);
                     self.model = msg["model"].as_str().map(String::from);
+                    if let Some(a) = msg["terminal_slash_commands"].as_array() {
+                        self.terminal_only = a.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                    }
                 }
                 Some("status") => self.status = msg["status"].as_str().unwrap_or("").to_string(),
                 _ => {}
@@ -597,6 +987,16 @@ impl Conversation {
             Value::Array(a) => a.clone(),
             _ => return,
         };
+        let images: Vec<UserImage> = blocks
+            .iter()
+            .filter(|b| b["type"] == "image")
+            .enumerate()
+            .map(|(k, b)| {
+                let kind = b["source"]["media_type"].as_str().and_then(|m| m.strip_prefix("image/")).unwrap_or("image").to_uppercase();
+                UserImage { name: format!("{kind} image {}", k + 1), width: 0, height: 0, texture: None }
+            })
+            .collect();
+        let mut images = Some(images);
         for b in &blocks {
             match b["type"].as_str() {
                 Some("tool_result") => {
@@ -622,7 +1022,7 @@ impl Conversation {
                 Some("text") => {
                     let text = strip_ide_tags(b["text"].as_str().unwrap_or(""));
                     if !text.is_empty() && !text.starts_with("<command-") && !text.starts_with("<local-command") {
-                        self.items.push(Item::User { text, context: None });
+                        self.items.push(Item::User { text, context: None, images: images.take().unwrap_or_default() });
                     }
                 }
                 _ => {}
@@ -971,11 +1371,11 @@ elif a[:2] == ["auth", "logout"]:
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// Drives a scripted stand-in for the CLI over real pipes: prompt → approval request → answer → result.
-    #[test]
-    fn session_roundtrip_with_a_fake_cli() {
-        let dir = std::env::temp_dir().join(format!("rim-fake-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A scripted stand-in for the CLI over real pipes: answers the handshake with a model
+    /// catalog, asks to run `ls` for a text prompt, echoes attached images, and answers
+    /// usage/status/export requests.
+    pub fn fake_session_cli(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
         let script = dir.join("claude");
         std::fs::write(
             &script,
@@ -985,8 +1385,39 @@ def out(m): print(json.dumps(m), flush=True)
 for line in sys.stdin:
     m = json.loads(line)
     if m["type"] == "user":
-        out({"type":"system","subtype":"init","session_id":"fake","model":"fake-model"})
+        imgs = [b for b in m["message"]["content"] if b["type"] == "image"]
+        out({"type":"system","subtype":"init","session_id":"fake","model":"fake-model","slash_commands":["compact","code-review","color"],"terminal_slash_commands":["color"]})
+        if imgs:
+            note = "images=%d media=%s data=%s" % (len(imgs), imgs[0]["source"]["media_type"], imgs[0]["source"]["data"])
+            out({"type":"assistant","message":{"id":"img","content":[{"type":"text","text":note}]}})
+            out({"type":"result","subtype":"success","is_error":False,"result":note})
+            continue
         out({"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tb"}})
+    elif m["type"] == "control_request" and m["request"]["subtype"] == "initialize":
+        out({"type":"control_response","response":{"subtype":"success","request_id":m["request_id"],"response":{
+            "models":[{"value":"default","displayName":"Default (recommended)","description":"Opus 5.5","supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsFastMode":True},
+                      {"value":"claude-fable-5-1","displayName":"Fable 5.1","description":"For your toughest challenges","supportedEffortLevels":["low","medium","high","xhigh","max"]},
+                      {"value":"haiku","displayName":"Haiku 4.5","description":"Fastest"},
+                      {"value":"old","displayName":"Retired","disabled":True}],
+            "output_style":"default","available_output_styles":["default","Concise","Explanatory"],
+            "commands":[{"name":"compact","description":"Free up context by summarizing the conversation so far","argumentHint":"<optional custom summarization instructions>","builtin":True},
+                        {"name":"code-review","description":"Review the current diff.\nSecond line.","argumentHint":"[low|medium|high]","aliases":["review"],"builtin":True},
+                        {"name":"color","description":"Set the prompt bar color","argumentHint":"[red|blue]","builtin":True},
+                        {"name":"__remote-workflow","description":"internal","argumentHint":"","builtin":True}],
+            "account":{"email":"me@example.test","organization":"Me's Org","subscriptionType":"Claude Pro"}}}})
+    elif m["type"] == "control_request" and m["request"]["subtype"] == "get_usage":
+        out({"type":"control_response","response":{"subtype":"success","request_id":m["request_id"],"response":{
+            "session":{"total_cost_usd":0.25},"subscription_type":"pro",
+            "rate_limits":{"five_hour":{"utilization":42},"limits":[
+                {"kind":"session","group":"session","percent":42,"resets_at":"2026-09-29T23:00:00Z","severity":"normal","is_active":True,"scope":None},
+                {"kind":"weekly_all","group":"weekly","percent":8,"resets_at":"2026-10-03T14:00:00Z","severity":"normal","is_active":False,"scope":None},
+                {"kind":"weekly_scoped","group":"weekly","percent":90,"resets_at":None,"scope":{"model":{"display_name":"Fable","id":None},"surface":None},"severity":"warning","is_active":False}]}}}})
+    elif m["type"] == "control_request" and m["request"]["subtype"] == "get_status":
+        out({"type":"control_response","response":{"subtype":"success","request_id":m["request_id"],"response":{"sections":[{"title":"Session","rows":[{"label":"Version","value":"9.9"},{"value":"a sentence"}]}]}}})
+    elif m["type"] == "control_request" and m["request"]["subtype"] == "export_conversation":
+        out({"type":"control_response","response":{"subtype":"success","request_id":m["request_id"],"response":{"text":"> go\n\nok","default_filename":"2026-go.txt"}}})
+    elif m["type"] == "control_request" and m["request"]["subtype"] == "set_model":
+        out({"type":"control_response","response":{"subtype":"error","request_id":m["request_id"],"error":"no such model"}})
     elif m["type"] == "control_response":
         ok = m["response"]["response"]["behavior"] == "allow"
         out({"type":"result","subtype":"success","is_error":False,"result":"allowed" if ok else "denied"})
@@ -1000,13 +1431,27 @@ for line in sys.stdin:
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let opts = Options { model: Some("haiku".into()), permission_mode: "manual".into(), resume: None };
+        script
+    }
+
+    /// Drives a scripted stand-in for the CLI over real pipes: prompt → approval request → answer → result.
+    #[test]
+    fn session_roundtrip_with_a_fake_cli() {
+        let dir = std::env::temp_dir().join(format!("rim-fake-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = fake_session_cli(&dir);
+        let opts = Options { model: Some("haiku".into()), permission_mode: "manual".into(), resume: None, settings: SessionSettings::default() };
         let mut s = Session::start(&script, &dir, &opts, egui::Context::default()).unwrap();
-        s.send_user("go");
+        s.send_user_with("go", &[]);
         let mut convo = Conversation::default();
+        let replies: std::cell::RefCell<Vec<Reply>> = Default::default();
         let wait = |s: &mut Session, convo: &mut Conversation, pred: &dyn Fn(&Conversation) -> bool| {
             for _ in 0..200 {
                 for m in s.poll() {
+                    if let Some(r) = s.reply(&m) {
+                        replies.borrow_mut().push(r);
+                        continue;
+                    }
                     convo.handle(&m);
                 }
                 if pred(convo) {
@@ -1017,13 +1462,93 @@ for line in sys.stdin:
             panic!("timed out");
         };
         wait(&mut s, &mut convo, &|c| c.has_pending());
+        // The handshake sent at start was answered: catalog, styles and account.
+        let init = replies.borrow_mut().drain(..).find_map(|r| match r { Reply::Init(i) => Some(i), _ => None }).expect("initialize reply");
+        let labels: Vec<&str> = init.models.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Default (recommended)", "Fable 5.1", "Haiku 4.5", "Retired"]);
+        assert_eq!(init.models[0].value, None);
+        assert_eq!(init.models[1].value.as_deref(), Some("claude-fable-5-1"));
+        assert!(init.models[0].fast_mode && !init.models[1].fast_mode && init.models[3].disabled);
+        assert_eq!(init.output_styles, ["default", "Concise", "Explanatory"]);
+        assert_eq!(init.account.email.as_deref(), Some("me@example.test"));
+        let names: Vec<&str> = init.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["compact", "code-review", "color"], "internal __ commands are dropped");
+        assert_eq!(init.commands[1].aliases, ["review"]);
+        assert_eq!(init.commands[1].summary(), "Review the current diff.");
+        assert_eq!(convo.terminal_only, ["color"]);
+        // Other requests are answered by kind; an error reply names it.
+        s.request_usage();
+        s.request_status();
+        s.request_export();
+        s.set_model("nope");
+        wait(&mut s, &mut convo, &|_| replies.borrow().len() >= 3);
+        let got = replies.borrow_mut().drain(..).collect::<Vec<_>>();
+        let usage = got.iter().find_map(|r| match r { Reply::Usage(u) => Some(u.clone()), _ => None }).unwrap();
+        assert_eq!(usage.rows.len(), 3);
+        assert_eq!((usage.rows[0].label.as_str(), usage.rows[0].percent), ("Current session (5 hours)", 42.0));
+        assert_eq!(usage.rows[1].label, "This week (all models)");
+        assert_eq!((usage.rows[2].label.as_str(), usage.rows[2].severity.as_str(), usage.rows[2].resets_at.as_deref()), ("This week (Fable)", "warning", None));
+        assert_eq!(usage.session_cost_usd, Some(0.25));
+        let status = got.iter().find_map(|r| match r { Reply::Status(st) => Some(st.clone()), _ => None }).unwrap();
+        assert_eq!(status, vec![("Session".to_string(), vec![("Version".to_string(), "9.9".to_string()), (String::new(), "a sentence".to_string())])]);
+        assert!(got.iter().any(|r| matches!(r, Reply::Export { text, filename } if text == "> go\n\nok" && filename == "2026-go.txt")));
+        // `set_model` answers aren't surfaced (the CLI reports the model in its next init message).
+        assert!(!got.iter().any(|r| matches!(r, Reply::Error(..))));
         assert_eq!(convo.model.as_deref(), Some("fake-model"));
         s.respond("q1", json!({ "behavior": "allow", "updatedInput": { "command": "ls" } }));
         convo.busy = true;
         wait(&mut s, &mut convo, &|c| !c.busy);
         s.interrupt();
         wait(&mut s, &mut convo, &|c| !c.items.is_empty() && !c.busy);
+        // A prompt with a picture: the image block goes first, base64-encoded.
+        let img = ImageData { media_type: "image/png".into(), bytes: vec![1, 2, 3] };
+        convo.busy = true;
+        convo.items.clear();
+        s.send_user_with("what is this", &[img]);
+        wait(&mut s, &mut convo, &|c| !c.busy);
         drop(s);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn session_settings_become_flags() {
+        let d = SessionSettings::default();
+        assert!(d.args().is_empty() && d.settings_json().is_none());
+        let s = SessionSettings { effort: Some("xhigh".into()), fast_mode: true, thinking: false, output_style: Some("Concise".into()), switch_models_on_flag: Some(true) };
+        let a = s.args();
+        assert_eq!(&a[..2], ["--effort", "xhigh"]);
+        assert_eq!(a[2], "--settings");
+        let j: Value = serde_json::from_str(&a[3]).unwrap();
+        assert_eq!(j, json!({ "fastMode": true, "alwaysThinkingEnabled": false, "outputStyle": "Concise", "switchModelsOnFlag": true }));
+        // `default` style and thinking on are the CLI's defaults: not sent.
+        let s = SessionSettings { output_style: Some("default".into()), thinking: true, ..Default::default() };
+        assert!(s.settings_json().is_none());
+    }
+
+    #[test]
+    fn user_message_puts_images_first() {
+        let img = ImageData { media_type: "image/jpeg".into(), bytes: b"hello".to_vec() };
+        let m = user_message("hi", &[img]);
+        let c = m["message"]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["type"], "image");
+        assert_eq!(c[0]["source"]["media_type"], "image/jpeg");
+        assert_eq!(c[0]["source"]["data"], "aGVsbG8=");
+        assert_eq!(c[1], json!({ "type": "text", "text": "hi" }));
+        assert_eq!(user_message("x", &[])["message"]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transcript_user_turns_keep_their_images() {
+        let mut c = Conversation::default();
+        c.handle(&json!({ "type": "user", "message": { "role": "user", "content": [
+            { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } },
+            { "type": "text", "text": "what is this" }
+        ] } }));
+        let Item::User { text, images, .. } = &c.items[0] else { panic!("{:?}", c.items) };
+        assert_eq!(text, "what is this");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name, "PNG image 1");
+        assert!(images[0].texture.is_none());
     }
 }
