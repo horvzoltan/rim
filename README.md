@@ -18,9 +18,19 @@ A small, fast code editor written in Rust (egui). It has no built-in terminal, b
     ./target/release/rim [folder-or-file]
 
 Needs Rust (https://rustup.rs). Runs on Linux and macOS.
-On macOS, install Apple's command-line tools first (`xcode-select --install`); the config file lives in
-`~/Library/Application Support/rim/config.toml` instead of `~/.config/rim/`. Start rim from a terminal so it
-sees your `PATH` (language servers, formatters, `claude`); apps started from the Dock/Finder get a minimal `PATH`.
+
+### Running on macOS
+    xcode-select --install                                           # Apple's command-line tools (compiler, linker, git)
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust, then open a new terminal
+    git clone git@github.com:horvzoltan/rim.git && cd rim
+    cargo build --release
+    ./target/release/rim ~/path/to/project
+
+Works on Apple Silicon and Intel Macs. Optionally put it on your `PATH` with `cargo install --path .`, then run `rim .`.
+- Start rim from a terminal so it sees your `PATH` (language servers, formatters, `claude`); apps started from the
+  Dock/Finder get a minimal `PATH`.
+- Shortcuts written as `Ctrl` below are `Cmd` on macOS (e.g. `Cmd+P`, `Cmd+Shift+P`, `Cmd+S`).
+- The config file lives in `~/Library/Application Support/rim/config.toml` instead of `~/.config/rim/`.
 
 Settings live in `~/.config/rim/config.toml`. Open it with "Preferences: Open config.toml"; saving the file reloads it.
 Language servers and formatters are ordinary programs on your `PATH`, configured per file extension in that file.
