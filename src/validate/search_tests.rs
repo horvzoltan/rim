@@ -2,6 +2,8 @@
 
 use super::*;
 
+const CASE: Options = Options { case_sensitive: true, whole_word: false };
+
 fn tree(name: &str, git: bool) -> PathBuf {
     let d = std::env::temp_dir().join(format!("rim-validate-search-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -56,7 +58,7 @@ fn quick_open_respects_gitignore_outside_a_repo() {
 #[test]
 fn project_search_matches_and_ignores() {
     let d = tree("ps", true);
-    let (res, trunc) = search(&d, "needle", false, 2000);
+    let (res, trunc) = search(&d, "needle", Options::default(), 2000);
     assert!(!trunc);
     let mut found: Vec<(String, usize, usize)> = res.iter().flat_map(|r| r.matches.iter().map(move |m| (r.rel.clone(), m.line, m.col))).collect();
     found.sort();
@@ -68,13 +70,13 @@ fn project_search_matches_and_ignores() {
     assert!(!found.iter().any(|f| f.0.starts_with("target") || f.0 == "app.log"));
     assert!(!found.iter().any(|f| f.0 == "bin.dat"), "binary (non-UTF-8) files are skipped");
     // Case-sensitive.
-    let (res, _) = search(&d, "NEEDLE", true, 2000);
+    let (res, _) = search(&d, "NEEDLE", CASE, 2000);
     let n: usize = res.iter().map(|r| r.matches.len()).sum();
     assert_eq!(n, 2);
     // Empty query.
-    assert!(search(&d, "", false, 10).0.is_empty());
+    assert!(search(&d, "", Options::default(), 10).0.is_empty());
     // Limit.
-    let (res, trunc) = search(&d, "needle", false, 2);
+    let (res, trunc) = search(&d, "needle", Options::default(), 2);
     assert!(trunc);
     assert_eq!(res.iter().map(|r| r.matches.len()).sum::<usize>(), 2);
     std::fs::remove_dir_all(d).ok();
@@ -87,7 +89,7 @@ fn search_line_with_length_changing_lowercase() {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("t.txt"), "İstanbul needle\n").unwrap();
-    let (res, _) = search(&d, "needle", false, 10);
+    let (res, _) = search(&d, "needle", Options::default(), 10);
     assert_eq!(res.len(), 1, "case-insensitive search misses lines containing chars whose lowercase has a different byte length");
     std::fs::remove_dir_all(d).ok();
 }
@@ -98,7 +100,24 @@ fn search_multiple_matches_on_one_line() {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("t.txt"), "a x a x a\n").unwrap();
-    let (res, _) = search(&d, "a", false, 10);
+    let (res, _) = search(&d, "a", Options::default(), 10);
     eprintln!("matches on a line with 3 hits: {}", res[0].matches.len());
+    std::fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn whole_word_search_skips_matches_inside_words() {
+    let d = std::env::temp_dir().join(format!("rim-validate-search-words-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("t.txt"), "    needles and needle_x\n  a needles Needle.\nneedle\n").unwrap();
+    let words = Options { case_sensitive: false, whole_word: true };
+    let (res, _) = search(&d, "needle", words, 10);
+    let hits: Vec<(usize, usize, usize, &str)> =
+        res[0].matches.iter().map(|m| (m.line, m.col, m.text_col, m.text.as_str())).collect();
+    // Line 0 only has "needle" inside longer words; on line 1 the match is the second one.
+    assert_eq!(hits, vec![(1, 12, 10, "a needles Needle."), (2, 0, 0, "needle")]);
+    let (res, _) = search(&d, "needle", Options { case_sensitive: true, whole_word: true }, 10);
+    assert_eq!(res[0].matches.iter().map(|m| m.line).collect::<Vec<_>>(), vec![2]);
     std::fs::remove_dir_all(d).ok();
 }
