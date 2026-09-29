@@ -3,7 +3,8 @@
 //! Included from chat.rs as a child module.
 
 use super::*;
-use egui::{Event, Pos2, Rect, Shape};
+use crate::md;
+use egui::{Event, Pos2, Rect, Shape, vec2};
 use std::time::Duration;
 
 const FAKE_STREAM_CLI: &str = r#"#!/usr/bin/env python3
