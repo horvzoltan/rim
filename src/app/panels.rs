@@ -11,6 +11,15 @@ impl App {
                 && ui.add(egui::Label::new(RichText::new("Claude is working…").color(t.orange)).sense(Sense::click())).clicked() {
                     self.show_claude = true;
                 }
+            if self.graph.scanning {
+                ui.label(RichText::new("Scanning project graph…").color(t.comment));
+            }
+            if let Some((done, total)) = self.describe_progress() {
+                let label = RichText::new(format!("Describing {done}/{total}…")).color(t.orange);
+                if ui.add(egui::Label::new(label).sense(Sense::click())).on_hover_text("Open the project graph").clicked() && !self.show_graph {
+                    self.toggle_graph();
+                }
+            }
             if let (true, Some(d)) = (self.cfg.vim_mode, self.active.and_then(|i| self.docs.get(i))) {
                 let color = match d.vim.mode {
                     vim::Mode::Normal => t.blue,
@@ -36,6 +45,8 @@ impl App {
                 }
             }
             if let Some(i) = self.active {
+                let main_server = if self.docs[i].path.is_some() { self.servers_for_doc(i).into_iter().next() } else { None };
+                let suggest = if main_server.is_none() { self.suggested_package(i) } else { None };
                 let d = &self.docs[i];
                 if let Some(p) = &d.path {
                     let diags = self.diagnostics.get(&lsp::uri(p)).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -43,7 +54,13 @@ impl App {
                     let warns = diags.iter().filter(|d| d.severity == 2).count();
                     ui.label(RichText::new(format!("✖ {errs}")).color(if errs > 0 { t.red } else { t.comment }));
                     ui.label(RichText::new(format!("⚠ {warns}")).color(if warns > 0 { t.yellow } else { t.comment }));
-                    if let Some(s) = self.cfg.server_for_ext(&d.ext) {
+                    if let Some(p) = suggest {
+                        let label = RichText::new(format!("Install {} support…", p.languages)).color(t.comment);
+                        if ui.add(egui::Label::new(label).sense(Sense::click())).on_hover_text(format!("Set up {} in Settings → Language Servers", p.name)).clicked() {
+                            self.open_language_servers(Some(p.id));
+                        }
+                    }
+                    if let Some(s) = &main_server {
                         if let Some(c) = self.lsp.get(&s.name) {
                             let text = c.progress_text().map(|p| format!("{}: {p}", s.name)).unwrap_or(s.name.clone());
                             let text: String = text.chars().take(80).collect();
@@ -82,7 +99,6 @@ impl App {
             ui.spacing_mut().item_spacing.x = 4.0;
             let panels = [
                 (Sidebar::Explorer, Icon::Files, "Explorer (Ctrl+Shift+E)", Cmd::Explorer),
-                (Sidebar::Search, Icon::Search, "Search (Ctrl+Shift+F)", Cmd::Search),
                 (Sidebar::Git, Icon::Git, "Source Control (Ctrl+Shift+G)", Cmd::SourceControl),
             ];
             for (s, icon, tip, cmd) in panels {
@@ -100,6 +116,10 @@ impl App {
                     self.claude_toggle();
                 }
             }
+            let tip = if self.show_graph { "Back to the editor (Esc)" } else { "Project Graph (Ctrl+Shift+M)" };
+            if icon_button(ui, &t, Icon::Graph, self.show_graph, 0).on_hover_text(tip).clicked() {
+                self.run(Cmd::ProjectGraph);
+            }
         });
         ui.add_space(2.0);
         ui.separator();
@@ -111,7 +131,6 @@ impl App {
                     self.tree_action(a);
                 }
             }
-            Sidebar::Search => self.search_ui(ui),
             Sidebar::Git => self.git_ui(ui),
         }
     }
@@ -132,63 +151,6 @@ impl App {
                 self.dialog = Some(Dialog::Input { kind: InputKind::Rename(p), value, focus: true })
             }
             TreeAction::Delete(p) => self.dialog = Some(Dialog::Trash(p)),
-        }
-    }
-
-    pub(super) fn search_ui(&mut self, ui: &mut Ui) {
-        let t = self.theme.clone();
-        let mut run = false;
-        ui.horizontal(|ui| {
-            let resp = ui.add(TextEdit::singleline(&mut self.search.query).hint_text("Search in files").desired_width(ui.available_width() - 36.0));
-            if self.search.focus {
-                resp.request_focus();
-                self.search.focus = false;
-            }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                run = true;
-            }
-            let case = RichText::new("Aa").color(if self.search.case_sensitive { t.blue } else { t.comment });
-            if ui.add(egui::Button::new(case).frame(false)).on_hover_text("Match case").clicked() {
-                self.search.case_sensitive = !self.search.case_sensitive;
-                run = true;
-            }
-        });
-        if run && !self.search.query.is_empty() {
-            self.search.running = true;
-            let (tx, ctx, root) = (self.tasks_tx.clone(), self.ctx.clone(), self.root.clone());
-            let (query, case_sensitive) = (self.search.query.clone(), self.search.case_sensitive);
-            std::thread::spawn(move || {
-                let (results, truncated) = search::search(&root, &query, case_sensitive, 2000);
-                let _ = tx.send(Task::Search { query, case_sensitive, results, truncated });
-                ctx.request_repaint();
-            });
-        }
-        if self.search.running {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Searching…").color(t.comment).size(12.0));
-            });
-        }
-        if self.search.searched {
-            let n: usize = self.search.results.iter().map(|r| r.matches.len()).sum();
-            let more = if self.search.truncated { "+" } else { "" };
-            ui.label(RichText::new(format!("{n}{more} results in {} files", self.search.results.len())).color(t.comment).size(12.0));
-        }
-        let mut open = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for r in &self.search.results {
-                ui.label(RichText::new(&r.rel).color(t.blue).size(12.5));
-                for m in &r.matches {
-                    let text = format!("{:>5}  {}", m.line + 1, m.text);
-                    let resp = ui.add(egui::Button::new(RichText::new(text).monospace().size(12.0).color(t.fg_dim)).frame(false).truncate());
-                    if resp.clicked() {
-                        open = Some((r.path.clone(), m.line, m.col, m.len));
-                    }
-                }
-            }
-        });
-        if let Some((p, l, c, len)) = open {
-            self.open_at(&p, l, c, len);
         }
     }
 
@@ -252,7 +214,7 @@ impl App {
         let mut nav: Option<bool> = None;
         // Esc closes the bar whether the find box or the editor has focus. Checked before the text
         // field runs, because it gives up focus on Esc.
-        let mut close = !self.palette.open && self.dialog.is_none() && ui.input(|i| i.key_pressed(Key::Escape));
+        let mut close = !self.palette.open && !self.find_files.open && self.dialog.is_none() && ui.input(|i| i.key_pressed(Key::Escape));
         Frame::NONE.fill(t.bg_dark).inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add(TextEdit::singleline(&mut self.find.query).hint_text("Find").desired_width(260.0));
@@ -331,6 +293,10 @@ impl App {
     }
 
     pub(super) fn central(&mut self, ui: &mut Ui) {
+        if self.show_graph {
+            self.graph_ui(ui);
+            return;
+        }
         if self.docs.is_empty() {
             self.welcome(ui);
             return;
@@ -340,12 +306,11 @@ impl App {
             self.find_bar(ui);
         }
         let Some(i) = self.active else { return };
+        let main_server = self.servers_for_doc(i).into_iter().next().map(|s| s.name);
         let uri = self.docs[i].path.as_ref().map(|p| lsp::uri(p));
         let diags: &[Diagnostic] = uri.as_ref().and_then(|u| self.diagnostics.get(u)).map(|v| v.as_slice()).unwrap_or(&[]);
-        let triggers: &[String] = self
-            .cfg
-            .server_for_ext(&self.docs[i].ext)
-            .and_then(|s| self.lsp.get(&s.name))
+        let triggers: &[String] = main_server
+            .and_then(|s| self.lsp.get(&s))
             .map(|c| c.trigger_characters())
             .unwrap_or(&[]);
         let (matches, current) = if self.find.open && self.find.cache.0 == self.docs[i].id {
@@ -364,7 +329,7 @@ impl App {
             hover: &mut self.hover,
             matches,
             current_match: current,
-            request_focus: std::mem::take(&mut self.focus_editor) && !self.palette.open,
+            request_focus: std::mem::take(&mut self.focus_editor) && !self.palette.open && !self.find_files.open,
             triggers,
             vim: if self.cfg.vim_mode { Some(&mut self.vim_shared) } else { None },
         };
@@ -383,6 +348,7 @@ impl App {
                     self.lsp_request(i, "textDocument/hover", ci, Pending::Hover { doc_id, char_idx: ci })
                 }
                 EditorEvent::Definition(ci) => self.lsp_request(i, "textDocument/definition", ci, Pending::Definition),
+                EditorEvent::CompletionAccepted { item, at } => self.resolve_completion(i, item, at),
                 EditorEvent::Save => self.save(i, true),
                 EditorEvent::SaveClose => {
                     // Closes once the file is really written (formatting on save is asynchronous).
@@ -434,6 +400,11 @@ impl App {
                         let b = it.id.clone();
                         self.git_do("checkout", |r| r.checkout(&b));
                         self.tree.invalidate();
+                    }
+                    (Mode::CodeActions, Some(it)) => {
+                        if let Ok(k) = it.id.parse::<usize>() {
+                            self.run_code_action(k);
+                        }
                     }
                     (Mode::GotoLine, _) => {
                         if let (Ok(n), Some(d)) = (query.trim().parse::<usize>(), self.active_doc()) {
@@ -494,9 +465,9 @@ impl App {
 #[derive(Clone, Copy)]
 enum Icon {
     Files,
-    Search,
     Git,
     Claude,
+    Graph,
 }
 
 /// A square sidebar button with a painted icon; `active` gets a background and an accent bar underneath,
@@ -531,11 +502,6 @@ fn icon_button(ui: &mut Ui, t: &Theme, icon: Icon, active: bool, badge: usize) -
             let front = vec![pos2(l, tp), pos2(r - 3.0, tp), pos2(r, tp + 3.0), pos2(r, b), pos2(l, b)];
             p.add(egui::Shape::closed_line(front, s));
         }
-        Icon::Search => {
-            let lens = c + vec2(-2.0, -2.0);
-            p.circle_stroke(lens, 5.0, s);
-            p.line_segment([lens + vec2(3.6, 3.6), lens + vec2(8.5, 8.5)], Stroke::new(2.0, color));
-        }
         Icon::Git => {
             // A branch: trunk on the left, a side branch curving in from the right.
             let (a, b, side) = (c + vec2(-4.0, -7.0), c + vec2(-4.0, 7.0), c + vec2(5.0, -4.0));
@@ -549,6 +515,16 @@ fn icon_button(ui: &mut Ui, t: &Theme, icon: Icon, active: bool, badge: usize) -
             p.add(curve);
             for pt in [a, b, side] {
                 p.circle_stroke(pt, 2.3, s);
+            }
+        }
+        Icon::Graph => {
+            // Three linked nodes: a small network.
+            let (a, b, d) = (c + vec2(-6.0, 5.0), c + vec2(6.0, 5.0), c + vec2(0.0, -6.0));
+            for (x, y) in [(a, b), (b, d), (d, a)] {
+                p.line_segment([x, y], s);
+            }
+            for pt in [a, b, d] {
+                p.circle_filled(pt, 2.6, color);
             }
         }
         Icon::Claude => {

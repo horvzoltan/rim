@@ -39,23 +39,23 @@ impl App {
                     }
                     self.refresh_git(true);
                 }
-                Task::Search { query, case_sensitive, results, truncated } => {
-                    if query == self.search.query && case_sensitive == self.search.case_sensitive {
-                        self.search.results = results;
-                        self.search.truncated = truncated;
-                        self.search.searched = true;
-                        self.search.running = false;
-                    }
-                }
+                Task::LspInstall { folder, event } => self.lsp_install_event(folder, event),
+                Task::Search { seq, results, truncated } => self.find_files.set_results(seq, results, truncated),
                 Task::Files { root, files } => {
                     self.file_list_running = false;
                     if root == self.root {
                         if self.palette.open && matches!(self.palette.mode, Mode::Files | Mode::Mention) {
                             self.palette.set_items(files.iter().map(|f| Item::new(f.clone(), f.clone(), "")).collect());
                         }
+                        // Files came or went: the graph is stale.
+                        if self.graph.data.as_ref().is_some_and(|g| g.file_count != files.len()) {
+                            self.graph.dirty = true;
+                        }
                         self.file_list = Some((Instant::now(), files));
                     }
                 }
+                Task::Graph { root, graph, cache } => self.apply_graph(root, graph, cache),
+                Task::Describe { root, rel, hash, result } => self.describe_result(root, rel, hash, result),
             }
         }
     }

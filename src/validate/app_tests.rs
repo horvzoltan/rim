@@ -36,7 +36,11 @@ fn write(root: &Path, rel: &str, s: &str) -> PathBuf {
 impl H {
     /// `tweak` edits the config that is written before the app starts.
     fn new(root: &Path, tweak: impl FnOnce(&mut Config)) -> Self {
-        let g = test_env::lock();
+        Self::with_lock(test_env::lock(), root, tweak)
+    }
+
+    /// Like `new`, for tests that prepared shared state (installed servers) under the lock.
+    fn with_lock(g: MutexGuard<'static, ()>, root: &Path, tweak: impl FnOnce(&mut Config)) -> Self {
         let tools = test_env::base().join("tools");
         let lsp = crate::lsp::validate_tests::fake_lsp(&tools.join(root.file_name().unwrap()));
         let claude = crate::claude::tests::fake_auth_cli(&tools.join("claude"));
@@ -45,7 +49,7 @@ impl H {
                 name: "fake".into(),
                 command: vec![lsp.to_string_lossy().to_string()],
                 extensions: vec!["rs".into()],
-                initialization_options: None,
+                ..Default::default()
             }],
             ..Config::default()
         };
@@ -240,23 +244,37 @@ fn quick_open_lists_non_ignored_files_and_opens() {
 }
 
 #[test]
-fn project_search_panel_opens_result_at_match() {
+fn find_in_files_popup_previews_and_opens_the_selected_match() {
     let root = scratch("psearch");
     write(&root, "a.txt", "one\n  two needle\n");
+    write(&root, "b.rs", "fn needles() {}\nlet needle = 1;\n");
     let mut h = H::new(&root, |_| {});
     h.key_m(Key::F, CTRL | Modifiers::SHIFT);
-    assert!(h.app.sidebar == Sidebar::Search);
+    assert!(h.app.find_files.open);
     h.frame(vec![]);
     h.typing("needle");
+    // Results arrive as you type, without pressing Enter.
+    h.until("search results", |a| a.find_files.results.len() == 2);
+    // Whole words drops the `needles` match.
+    h.app.find_files.opts.whole_word = true;
+    h.app.find_files.changed_at_for_test();
+    h.until("whole-word results", |a| !a.find_files.results.is_empty() && a.find_files.rows_len() == 2);
+    // Pick the match in b.rs; the preview follows the selection.
+    let row = (0..2).find(|&i| h.app.find_files.row_path(i).ends_with("b.rs")).unwrap();
+    for _ in 0..row {
+        h.key(Key::ArrowDown);
+    }
+    assert!(h.app.find_files.preview_path().unwrap().ends_with("b.rs"));
     h.key(Key::Enter);
     h.frame(vec![]);
-    assert_eq!(h.app.search.results.len(), 1);
-    let m = &h.app.search.results[0].matches[0];
-    let (p, l, c, len) = (h.app.search.results[0].path.clone(), m.line, m.col, m.len);
-    h.app.open_at(&p, l, c, len);
-    h.frame(vec![]);
-    let s = h.doc().text.find("needle").unwrap();
+    assert!(!h.app.find_files.open);
+    let s = h.doc().text.find("needle =").unwrap();
     assert_eq!(h.sel(), (s, s + 6));
+    // Reopening keeps the query; Escape closes.
+    h.key_m(Key::F, CTRL | Modifiers::SHIFT);
+    assert_eq!(h.app.find_files.query, "needle");
+    h.key(Key::Escape);
+    assert!(!h.app.find_files.open);
 }
 
 // ---------------- open / save edge cases ----------------
@@ -366,6 +384,164 @@ fn lsp_sync_completion_hover_definition_diagnostics() {
     let before = lsp_log(&root).iter().filter(|m| m["method"] == "textDocument/didClose").count();
     h.key_m(Key::W, CTRL);
     h.until("didClose", |_| lsp_log(&root).iter().filter(|m| m["method"] == "textDocument/didClose").count() > before);
+}
+
+/// typescript-language-server style auto-import: the completion arrives without its import,
+/// which comes from `completionItem/resolve` after the item is accepted.
+#[test]
+fn completion_auto_import_arrives_after_resolve() {
+    let root = scratch("lsp-autoimport");
+    let p = write(&root, "a.rs", "fn main() {\n    \n}\n");
+    let mut h = H::new(&root, |_| {});
+    let i = h.app.open_path(&p).unwrap();
+    h.frame(vec![]);
+    h.until("server ready", |a| a.lsp.get("fake").is_some_and(|c| c.ready));
+    h.app.docs[i].pending_sel = Some((16, 16));
+    h.frame(vec![]);
+    h.typing("Th");
+    h.until("completion popup", |a| a.completion.as_ref().is_some_and(|c| c.items.iter().any(|it| it.label == "Thing")));
+    h.key(Key::Enter);
+    let want = "use things::Thing;\nfn main() {\n    Thing\n}\n";
+    h.until("import added after resolve", |a| a.docs[i].text == want);
+    let resolve = lsp_log(&root).into_iter().find(|m| m["method"] == "completionItem/resolve").expect("resolve sent");
+    assert_eq!(resolve["params"]["label"], "Thing");
+    // The cursor stayed after the completed word: typing continues there.
+    h.frame(vec![]);
+    h.typing("X");
+    assert_eq!(h.app.docs[i].text, "use things::Thing;\nfn main() {\n    ThingX\n}\n");
+
+    // A resolve answer for text that changed since is dropped.
+    let before = h.app.docs[i].text.clone();
+    let id = h.app.docs[i].id;
+    let late = json!({ "additionalTextEdits": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "newText": "use late;\n" }] });
+    h.app.apply_resolved_completion(id, 30, 12345, &late);
+    assert_eq!(h.app.docs[i].text, before);
+    // ...and so is one that would edit after the completion's start.
+    let at = before.find("ThingX").unwrap();
+    let hash = crate::text::hash_str(&before[..at]);
+    let after = json!({ "additionalTextEdits": [{ "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 0 } }, "newText": "x" }] });
+    h.app.apply_resolved_completion(id, at, hash, &after);
+    assert_eq!(h.app.docs[i].text, before);
+}
+
+/// Ctrl+. offers the server's code actions for the problem on the cursor's line and applies them:
+/// a direct edit, a command that makes the server send an edit back, one resolved lazily, and an
+/// edit to a file that isn't open.
+#[test]
+fn quick_fixes_apply_edits_commands_and_resolved_actions() {
+    let root = scratch("lsp-quickfix");
+    let p = write(&root, "b.rs", "fn main() {\n    let x = bad;\n}\n");
+    let other = write(&root, "other.rs", "fn other() {}\n");
+    let other_uri = lsp::uri(&other.canonicalize().unwrap());
+    let mut h = H::new(&root, |c| {
+        c.language_servers[0].env.insert("FAKE_LSP_OTHER".into(), other_uri.clone());
+    });
+    let i = h.app.open_path(&p).unwrap();
+    h.frame(vec![]);
+    let uri = lsp::uri(&p);
+    h.until("diagnostic", |a| a.diagnostics.get(&uri).is_some_and(|d| !d.is_empty()));
+    // Cursor at the start of the line, not on the problem itself.
+    h.app.docs[i].pending_sel = Some((16, 16));
+    h.frame(vec![]);
+    h.key_m(Key::Period, CTRL);
+    h.until("quick-fix menu", |a| a.palette.open && a.palette.mode == Mode::CodeActions && a.quick_fix.waiting == 0);
+    let titles: Vec<String> = h.app.quick_fix.actions.iter().map(|a| a.title.clone()).collect();
+    assert_eq!(titles, ["Replace 'bad' with 'good'", "Touch the other file", "Add a footer (resolved later)", "Add a header (command)"]);
+    let req = lsp_log(&root).into_iter().rfind(|m| m["method"] == "textDocument/codeAction").unwrap();
+    assert_eq!(req["params"]["context"]["diagnostics"][0]["message"], "bad word", "the line's diagnostic is sent as context");
+    // Enter takes the preferred fix.
+    h.key(Key::Enter);
+    assert_eq!(h.app.docs[i].text, "fn main() {\n    let x = good;\n}\n");
+    assert!(!h.app.palette.open);
+
+    let pick = |h: &mut H, title: &str| {
+        h.app.quick_fix();
+        h.until("actions", |a| a.quick_fix.waiting == 0 && !a.quick_fix.actions.is_empty());
+        let k = h.app.quick_fix.actions.iter().position(|a| a.title == title).unwrap();
+        h.app.palette.open = false;
+        h.app.run_code_action(k);
+    };
+    pick(&mut h, "Add a header (command)");
+    h.until("server-sent edit applied", |a| a.docs[i].text.starts_with("// header\n"));
+    h.until("applyEdit answered", |_| lsp_log(&root).iter().any(|m| m["result"]["applied"] == true));
+    pick(&mut h, "Add a footer (resolved later)");
+    h.until("resolved edit applied", |a| a.docs[i].text.ends_with("}\n// footer\n"));
+    assert_eq!(h.app.docs[i].text, "// header\nfn main() {\n    let x = good;\n}\n// footer\n");
+    // An edit to a file that isn't open opens it in a tab, unsaved; the current tab stays active.
+    pick(&mut h, "Touch the other file");
+    let o = h.app.docs.iter().position(|d| d.title == "other.rs").expect("other.rs opened");
+    assert_eq!(h.app.docs[o].text, "// touched\nfn other() {}\n");
+    assert!(h.app.docs[o].is_dirty());
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "fn other() {}\n", "not written to disk");
+    assert_eq!(h.app.active, Some(i));
+}
+
+/// Pull diagnostics (TypeScript 7 style): rim asks for each file's problems after opening and
+/// editing it, re-asks the other open files when one changes, and again when the server says so.
+#[test]
+fn pull_diagnostics_follow_edits_other_files_and_refreshes() {
+    let root = scratch("lsp-pull");
+    let a = write(&root, "a.rs", "fn main() {\n    bad();\n    missing();\n}\n");
+    let b = write(&root, "b.rs", "fn other() {}\n");
+    let mut h = H::new(&root, |c| {
+        c.language_servers[0].env.insert("FAKE_LSP_PULL".into(), "1".into());
+    });
+    let (ua, ub) = (lsp::uri(&a), lsp::uri(&b));
+    let msgs = |h: &H, uri: &str| -> Vec<String> {
+        h.app.diagnostics.get(uri).map(|d| d.iter().map(|d| d.message.clone()).collect()).unwrap_or_default()
+    };
+    let ia = h.app.open_path(&a).unwrap();
+    h.until("pulled on open", |a| a.diagnostics.get(&ua).is_some_and(|d| d.len() == 2));
+    let mut m = msgs(&h, &ua);
+    m.sort();
+    assert_eq!(m, ["bad word", "cannot find missing"]);
+    let req = lsp_log(&root).into_iter().find(|m| m["method"] == "textDocument/diagnostic").unwrap();
+    assert_eq!(req["params"]["identifier"], "fake");
+
+    // An edit is followed by a new pull.
+    h.app.docs[ia].set_text("fn main() {\n    good();\n    missing();\n}\n".into());
+    h.until("bad word gone", |a| a.diagnostics.get(&ua).is_some_and(|d| d.len() == 1));
+    assert_eq!(msgs(&h, &ua), ["cannot find missing"]);
+    // An edit that changes nothing gets "unchanged" (the previous answer's id is sent back) and
+    // the problems stay.
+    let pulls = |root: &Path| lsp_log(root).iter().filter(|m| m["method"] == "textDocument/diagnostic").count();
+    let before = pulls(&root);
+    h.app.docs[ia].set_text("fn main() {\n    good();\n    missing();\n}\n\n".into());
+    h.until("pulled again", |_| pulls(&root) > before);
+    let last = lsp_log(&root).into_iter().rfind(|m| m["method"] == "textDocument/diagnostic").unwrap();
+    assert!(last["params"]["previousResultId"].is_string());
+    for _ in 0..10 {
+        h.frame(vec![]);
+    }
+    assert_eq!(msgs(&h, &ua), ["cannot find missing"]);
+
+    // Quick fixes get the pulled problem as context.
+    h.app.docs[ia].pending_sel = Some((29, 29));
+    h.frame(vec![]);
+    h.app.quick_fix();
+    h.until("code actions", |a| a.quick_fix.waiting == 0);
+    let ca = lsp_log(&root).into_iter().rfind(|m| m["method"] == "textDocument/codeAction").unwrap();
+    assert_eq!(ca["params"]["context"]["diagnostics"][0]["message"], "cannot find missing");
+    h.app.palette.open = false;
+
+    // Defining `missing` in another file clears a.rs's problem: its problems are asked for again.
+    let ib = h.app.open_path(&b).unwrap();
+    h.until("b.rs pulled", |a| a.diagnostics.contains_key(&ub));
+    h.app.docs[ib].set_text("fn other() {}\nfn missing() {} // meh\n".into());
+    h.until("a.rs re-pulled after b.rs changed", |a| a.diagnostics.get(&ua).is_some_and(|d| d.is_empty()));
+
+    // Typing quickly: requests don't pile up, and the last text's problems win.
+    h.app.activate(ib);
+    h.app.docs[ib].pending_sel = Some((13, 13));
+    h.frame(vec![]);
+    h.typing(" bad");
+    h.until("b.rs problem after typing", |a| a.diagnostics.get(&ub).is_some_and(|d| d.len() == 1));
+    let d = &h.app.diagnostics[&ub][0];
+    assert_eq!((d.start, d.message.as_str()), ((0, 14), "bad word"));
+
+    // The server asks for a refresh (its rules changed): every open file is asked again.
+    h.app.lsp.get_mut("fake").unwrap().request("workspace/executeCommand", json!({ "command": "fake.strict" }), Pending::ExecuteCommand);
+    h.until("refreshed", |a| a.diagnostics.get(&ub).is_some_and(|d| d.iter().any(|d| d.message == "meh is not allowed")));
 }
 
 #[test]
@@ -660,10 +836,13 @@ fn many_frames_with_everything_open_do_not_panic() {
     h.app.open_path(&p);
     h.app.show_claude = true;
     h.app.chat.convo = crate::chat::demo_conversation();
-    for s in [Sidebar::Explorer, Sidebar::Search, Sidebar::Git] {
+    for s in [Sidebar::Explorer, Sidebar::Git] {
         h.app.sidebar = s;
         h.frame(vec![]);
     }
+    h.app.open_find_files();
+    h.frame(vec![]);
+    h.key(Key::Escape);
     h.key_m(Key::P, CTRL | Modifiers::SHIFT);
     h.frame(vec![]);
     h.typing("theme");
@@ -734,4 +913,175 @@ fn repeated_notifications_are_shown_once() {
     h.app.error("Failed to load workspaces.");
     h.app.info("Failed to load workspaces.");
     assert_eq!(h.toasts().len(), 2, "same text and kind once; an info with the same text is separate");
+}
+
+// ---------------- language server manager ----------------
+
+/// Put a fake language server where rim would have installed package `id` (before `H::new`,
+/// which loads the installed list).
+fn fake_install(id: &str) -> PathBuf {
+    let p = crate::lsp_registry::by_id(id).unwrap();
+    let dir = config::servers_dir().join(p.folder);
+    let info = crate::lsp_install::InstallInfo { version: "9.9.9".into(), bin: p.program().into(), installed_at: 0 };
+    let bin = crate::lsp_install::program_path(p, &dir, &info);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, crate::lsp::validate_tests::FAKE_LSP).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("rim-install.json"), serde_json::to_string(&info).unwrap()).unwrap();
+    bin
+}
+
+/// Take the test lock and start with no installed servers.
+fn clean_servers() -> MutexGuard<'static, ()> {
+    let g = test_env::lock();
+    let _ = std::fs::remove_dir_all(config::servers_dir());
+    g
+}
+
+/// The rect of the widget labelled `label` in the last frame (needs `show_interactive_widgets`).
+fn widget_rect(h: &H, label: &str) -> Vec<Rect> {
+    h.ctx.viewport(|vp| {
+        let w = &vp.prev_pass.widgets;
+        w.layer_ids()
+            .flat_map(|l| w.get_layer(l))
+            .filter(|r| w.info(r.id).and_then(|i| i.label.as_deref()) == Some(label))
+            .map(|r| r.rect)
+            .collect()
+    })
+}
+
+/// Regression: the row's click sensor used to be registered after its buttons and covered them,
+/// so clicking Install only toggled the row's details.
+#[test]
+fn install_button_in_a_row_is_clickable() {
+    let g = clean_servers();
+    let root = scratch("lsp-install-click");
+    let mut h = H::with_lock(g, &root, |_| {});
+    // Only a fake `npm` exists, so nothing touches the network.
+    let tools = test_env::base().join("tools").join("fake-npm");
+    std::fs::create_dir_all(&tools).unwrap();
+    let npm = tools.join("npm");
+    std::fs::write(
+        &npm,
+        r#"#!/bin/sh
+prefix=""; while [ $# -gt 0 ]; do case "$1" in --prefix) prefix="$2"; shift;; esac; shift; done
+mkdir -p "$prefix/node_modules/pyright/.bin" "$prefix/node_modules/.bin"
+echo '{"version":"1.2.3"}' > "$prefix/node_modules/pyright/package.json"
+printf '#!/bin/sh
+' > "$prefix/node_modules/.bin/pyright-langserver"; chmod +x "$prefix/node_modules/.bin/pyright-langserver"
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.app.lsp_mgr.which = std::sync::Arc::new(move |p: &str| (p == "npm").then(|| npm.clone()));
+    h.app.lsp_mgr.clear_cache();
+    h.ctx.all_styles_mut(|s| s.debug.show_interactive_widgets = true);
+    h.app.open_language_servers(None);
+    // The dialog sizes itself over a few frames; measure once it has settled.
+    // The dialog grows over a few frames to its full height; measure once the layout stops moving.
+    let mut last: Option<Rect> = None;
+    for _ in 0..200 {
+        h.frame(vec![]);
+        let now = widget_rect(&h, "Python").first().copied();
+        if now.is_some() && now == last {
+            break;
+        }
+        last = now;
+    }
+    let python = widget_rect(&h, "Python");
+    assert_eq!(python.len(), 1, "one Python row");
+    let row_y = python[0].center().y;
+    let install = widget_rect(&h, "Install")
+        .into_iter()
+        .find(|r| (r.center().y - row_y).abs() < 20.0)
+        .expect("an Install button on the Python row");
+    h.click(install.center());
+    assert_eq!(h.app.lsp_mgr.expanded, None, "the click reached the button, not the row");
+    h.until("pyright installed", |a| a.lsp_mgr.jobs.get("pyright").is_some_and(|j| !j.running));
+    assert_eq!(h.app.lsp_mgr.jobs["pyright"].error, None);
+    assert_eq!(h.app.lsp_mgr.installed["pyright"].version, "1.2.3");
+    // Clicking elsewhere on the row still opens its details.
+    h.click(python[0].center());
+    assert_eq!(h.app.lsp_mgr.expanded, Some("pyright"));
+}
+
+#[test]
+fn installed_server_runs_can_be_disabled_and_restarts_after_update() {
+    let g = clean_servers();
+    fake_install("taplo");
+    let root = scratch("lsp-installed");
+    let p = write(&root, "Cargo.toml", "[package]\nname = \"bad\"\n");
+    let mut h = H::with_lock(g, &root, |_| {});
+    h.app.open_path(&p);
+    h.until("taplo diagnostics", |a| a.diagnostics.values().any(|d| d.len() == 1) && a.lsp.get("taplo").is_some_and(|c| c.ready));
+    let i = h.app.active.unwrap();
+    let s = h.app.servers_for_doc(i);
+    assert!(s[0].managed && s[0].name == "taplo");
+    assert!(h.app.suggested_package(i).is_none());
+
+    // Disabled: stops, its problems go away, and it isn't suggested either.
+    h.app.lsp_set_enabled("taplo", false);
+    h.frame(vec![]);
+    assert!(!h.app.lsp.contains_key("taplo"));
+    assert!(h.app.diagnostics.values().all(|d| d.is_empty()));
+    assert!(h.app.servers_for_doc(i).is_empty());
+    assert!(h.app.cfg.disabled_language_servers == ["taplo"]);
+    h.app.lsp_set_enabled("taplo", true);
+    h.until("taplo back", |a| a.lsp.get("taplo").is_some_and(|c| c.ready));
+
+    // An update restarts it with the new copy, without restarting rim.
+    let info = crate::lsp_install::InstallInfo { version: "10.0.0".into(), bin: "taplo".into(), installed_at: 1 };
+    h.app.lsp_install_event("taplo".into(), lsp_manager::InstallEvent::Done(Ok(info)));
+    assert!(!h.app.lsp.contains_key("taplo"));
+    assert!(h.app.toasts.iter().any(|t| t.text.contains("Installed Taplo 10.0.0")));
+    h.until("taplo restarted", |a| a.lsp.get("taplo").is_some_and(|c| c.ready) && a.diagnostics.values().any(|d| d.len() == 1));
+}
+
+#[test]
+fn addon_diagnostics_merge_with_the_main_server() {
+    let g = clean_servers();
+    fake_install("vscode-eslint-language-server");
+    let root = scratch("lsp-addon");
+    let p = write(&root, "a.ts", "let bad = 1;\n");
+    let mut h = H::with_lock(g, &root, |c| {
+        c.language_servers.push(config::ServerConfig { extensions: vec!["ts".into()], name: "fake-ts".into(), ..c.language_servers[0].clone() });
+    });
+    h.app.open_path(&p);
+    let uri = lsp::uri(&p);
+    h.until("both servers report", |a| a.diagnostics.get(&uri).is_some_and(|d| d.len() == 2));
+    let i = h.app.active.unwrap();
+    let names: Vec<String> = h.app.servers_for_doc(i).into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["fake-ts", "vscode-eslint-language-server"]);
+    // Both servers get edits (each tracks the version it has seen).
+    h.app.docs[i].set_text("let ok = 1;\n".into());
+    h.until("both servers clear", |a| a.diagnostics.get(&uri).is_some_and(|d| d.is_empty()) && a.lsp_diags.len() == 2);
+    h.app.docs[i].set_text("bad\n".into());
+    h.until("both report again", |a| a.diagnostics.get(&uri).is_some_and(|d| d.len() == 2));
+    // Turning the add-on off leaves only the main server's problem.
+    h.app.lsp_set_enabled("vscode-eslint-language-server", false);
+    assert_eq!(h.app.diagnostics[&uri].len(), 1);
+}
+
+#[test]
+fn status_bar_suggests_a_server_and_opens_the_manager() {
+    let g = clean_servers();
+    let root = scratch("lsp-suggest");
+    let p = write(&root, "notes.svelte", "<p>hi</p>\n");
+    let mut h = H::with_lock(g, &root, |_| {});
+    h.app.open_path(&p);
+    h.frame(vec![]);
+    let i = h.app.active.unwrap();
+    let s = h.app.suggested_package(i).map(|p| p.id);
+    assert_eq!(s, Some("svelte-language-server"));
+    h.app.open_language_servers(s);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::Settings)));
+    assert!(h.app.lsp_mgr.tab == lsp_manager::SettingsTab::LanguageServers);
+    assert_eq!(h.app.lsp_mgr.expanded, Some("svelte-language-server"));
+    // The page draws (all rows, one expanded) without panicking.
+    h.frame(vec![]);
+    h.key(Key::Escape);
+    assert!(h.app.dialog.is_none());
 }

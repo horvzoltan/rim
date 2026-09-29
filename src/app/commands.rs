@@ -12,11 +12,14 @@ pub(super) enum Cmd {
     Format,
     FormatOnSave,
     GotoLine,
+    QuickFix,
     Find,
     Sidebar,
     Explorer,
     Search,
     SourceControl,
+    ProjectGraph,
+    GraphDescribeAll,
     FontBigger,
     FontSmaller,
     Theme,
@@ -34,6 +37,7 @@ pub(super) enum Cmd {
     GitLog,
     GitDiff,
     GitInit,
+    LanguageServers,
     ClaudeToggle,
     ClaudeNew,
     ClaudeStop,
@@ -70,14 +74,16 @@ macro_rules! cmds {
 // Ctrl+Shift+X must come before Ctrl+X.
 cmds![
     (Palette, "palette", "", "Ctrl+Shift+P", [CS + P]),
-    (Search, "search", "View: Search in Files", "Ctrl+Shift+F", [CS + F]),
+    (Search, "search", "Find in Files", "Ctrl+Shift+F", [CS + F]),
     (Explorer, "explorer", "View: Explorer", "Ctrl+Shift+E", [CS + E]),
     (SourceControl, "scm", "View: Source Control", "Ctrl+Shift+G", [CS + G]),
+    (ProjectGraph, "graph", "View: Project Graph", "Ctrl+Shift+M", [CS + M]),
     (PrevTab, "prev_tab", "", "Ctrl+Shift+Tab", [CS + Tab, C + PageUp]),
     (Format, "format", "Format Document", "Shift+Alt+F", [AS + F]),
     (QuickOpen, "quick_open", "", "Ctrl+P", [C + P]),
     (Find, "find", "Find in File", "Ctrl+F", [C + F]),
     (GotoLine, "goto", "Go to Line…", "Ctrl+G", [C + G]),
+    (QuickFix, "quick_fix", "Quick Fix… (Auto-Import, Fix Problem)", "Ctrl+.", [C + Period]),
     (Save, "save", "File: Save", "Ctrl+S", [C + S]),
     (SaveAll, "save_all", "File: Save All", "", []),
     (Close, "close", "File: Close Tab", "Ctrl+W", [C + W]),
@@ -87,6 +93,7 @@ cmds![
     (Quit, "quit", "Quit", "Ctrl+Q", [C + Q]),
     (NextTab, "next_tab", "", "Ctrl+Tab", [C + Tab, C + PageDown]),
     (SettingsDialog, "settings_ui", "Preferences: Settings", "Ctrl+,", [C + Comma]),
+    (LanguageServers, "language_servers", "Preferences: Language Servers", "", []),
     (ClaudeToggle, "claude_toggle", "Claude: Focus Chat / Toggle Panel", "Ctrl+L", [C + L]),
     (FormatOnSave, "fos", "Toggle Format on Save", "", []),
     (FontBigger, "font_inc", "View: Increase Editor Font Size", "", []),
@@ -109,6 +116,7 @@ cmds![
     (ClaudeStop, "claude_stop", "Claude: Stop", "", []),
     (ClaudeMention, "claude_mention", "Claude: Mention Current File", "", []),
     (LspRestart, "lsp_restart", "LSP: Restart Language Servers", "", []),
+    (GraphDescribeAll, "graph_describe_all", "Graph: Describe All with Claude", "", []),
 ];
 
 impl App {
@@ -127,6 +135,14 @@ impl App {
 
     pub(super) fn run(&mut self, cmd: Cmd) {
         match cmd {
+            Cmd::ProjectGraph => self.toggle_graph(),
+            Cmd::QuickFix => self.quick_fix(),
+            Cmd::GraphDescribeAll => {
+                if !self.show_graph {
+                    self.toggle_graph();
+                }
+                self.describe_all();
+            }
             Cmd::Save => {
                 if let Some(i) = self.active {
                     self.save(i, true);
@@ -167,10 +183,7 @@ impl App {
             }
             Cmd::Sidebar => self.show_sidebar = !self.show_sidebar,
             Cmd::Explorer => self.show_panel(Sidebar::Explorer),
-            Cmd::Search => {
-                self.show_panel(Sidebar::Search);
-                self.search.focus = true;
-            }
+            Cmd::Search => self.open_find_files(),
             Cmd::SourceControl => self.show_panel(Sidebar::Git),
             Cmd::FontBigger | Cmd::FontSmaller => {
                 let delta = if cmd == Cmd::FontBigger { 1.0 } else { -1.0 };
@@ -188,6 +201,7 @@ impl App {
             Cmd::SettingsDialog => self.dialog = Some(Dialog::Settings),
             Cmd::ToggleVim => self.set_vim(!self.cfg.vim_mode),
             Cmd::ClaudeToggle => self.claude_toggle(),
+            Cmd::LanguageServers => self.open_language_servers(None),
             Cmd::ClaudeNew => {
                 self.show_claude = true;
                 self.chat.reset();
