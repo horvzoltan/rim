@@ -1,0 +1,481 @@
+//! Layout pieces: status bar, sidebar, tabs, find bar, editor area, palette and toasts.
+
+use super::*;
+
+impl App {
+    pub(super) fn status_bar(&mut self, ui: &mut Ui) {
+        let t = self.theme.clone();
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            if self.chat.is_busy() && !self.show_claude
+                && ui.add(egui::Label::new(RichText::new("Claude is working…").color(t.orange)).sense(Sense::click())).clicked() {
+                    self.show_claude = true;
+                }
+            if let (true, Some(d)) = (self.cfg.vim_mode, self.active.and_then(|i| self.docs.get(i))) {
+                let color = match d.vim.mode {
+                    vim::Mode::Normal => t.blue,
+                    vim::Mode::Insert => t.green,
+                    vim::Mode::Visual | vim::Mode::VisualLine => t.purple,
+                };
+                ui.label(RichText::new(format!(" {} ", d.vim.label())).strong().color(t.bg_dark).background_color(color));
+                let pending = d.vim.pending();
+                if !pending.is_empty() {
+                    ui.label(RichText::new(pending).monospace().color(t.fg_dim));
+                }
+            }
+            if self.repo.is_some() {
+                let mut label = self.git.branch.clone();
+                if self.git.ahead > 0 || self.git.behind > 0 {
+                    label += &format!("  +{} -{}", self.git.ahead, self.git.behind);
+                }
+                if ui.add(egui::Label::new(RichText::new(label).color(t.purple)).sense(Sense::click())).on_hover_text("Checkout branch").clicked() {
+                    self.run(Cmd::GitCheckout);
+                }
+                if let Some(op) = &self.git_busy {
+                    ui.label(RichText::new(format!("git {op}…")).color(t.comment));
+                }
+            }
+            if let Some(i) = self.active {
+                let d = &self.docs[i];
+                if let Some(p) = &d.path {
+                    let diags = self.diagnostics.get(&lsp::uri(p)).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let errs = diags.iter().filter(|d| d.severity == 1).count();
+                    let warns = diags.iter().filter(|d| d.severity == 2).count();
+                    ui.label(RichText::new(format!("✖ {errs}")).color(if errs > 0 { t.red } else { t.comment }));
+                    ui.label(RichText::new(format!("⚠ {warns}")).color(if warns > 0 { t.yellow } else { t.comment }));
+                    if let Some(s) = self.cfg.server_for_ext(&d.ext) {
+                        if let Some(c) = self.lsp.get(&s.name) {
+                            let text = c.progress_text().map(|p| format!("{}: {p}", s.name)).unwrap_or(s.name.clone());
+                            let text: String = text.chars().take(80).collect();
+                            ui.label(RichText::new(text).color(if c.ready { t.fg_dim } else { t.comment }));
+                        } else if self.lsp_failed.contains(&s.name) {
+                            ui.label(RichText::new(format!("{} unavailable", s.name)).color(t.comment));
+                        }
+                    }
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(egui::Label::new(RichText::new(self.theme.name).color(t.comment)).sense(Sense::click())).clicked() {
+                    self.run(Cmd::Theme);
+                }
+                if self.cfg.format_on_save {
+                    ui.label(RichText::new("fmt on save").color(t.comment));
+                }
+                if let Some(i) = self.active {
+                    let d = &self.docs[i];
+                    ui.label(RichText::new(&d.syntax).color(t.fg_dim));
+                    let indent = if self.cfg.insert_spaces { format!("Spaces: {}", self.cfg.tab_size) } else { "Tabs".into() };
+                    ui.label(RichText::new(indent).color(t.fg_dim));
+                    let (l, c) = d.line_col();
+                    if ui.add(egui::Label::new(RichText::new(format!("Ln {}, Col {}", l + 1, c + 1)).color(t.fg_dim)).sense(Sense::click())).clicked() {
+                        self.run(Cmd::GotoLine);
+                    }
+                }
+            });
+        });
+    }
+
+    pub(super) fn sidebar_ui(&mut self, ui: &mut Ui) {
+        let t = self.theme.clone();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (s, label) in [(Sidebar::Explorer, "Explorer"), (Sidebar::Search, "Search"), (Sidebar::Git, "Git")] {
+                let mut text = RichText::new(label).size(13.0);
+                if s == Sidebar::Git && !self.git.files.is_empty() {
+                    text = RichText::new(format!("{label} {}", self.git.files.len())).size(13.0);
+                }
+                let color = if self.sidebar == s { t.fg } else { t.comment };
+                if ui.add(egui::Button::new(text.color(color)).frame(self.sidebar == s)).clicked() {
+                    self.sidebar = s;
+                }
+            }
+        });
+        ui.add_space(2.0);
+        ui.separator();
+        match self.sidebar {
+            Sidebar::Explorer => {
+                let name = self.root.file_name().map(|n| n.to_string_lossy().to_uppercase()).unwrap_or_default();
+                ui.label(RichText::new(name).size(11.5).color(t.comment).strong());
+                if let Some(a) = self.tree.show(ui, &t, &self.file_colors) {
+                    self.tree_action(a);
+                }
+            }
+            Sidebar::Search => self.search_ui(ui),
+            Sidebar::Git => self.git_ui(ui),
+        }
+    }
+
+    pub(super) fn tree_action(&mut self, a: TreeAction) {
+        match a {
+            TreeAction::Open(p) => {
+                self.open_path(&p);
+            }
+            TreeAction::NewFile(d) => {
+                self.dialog = Some(Dialog::Input { kind: InputKind::NewFile(d), value: String::new(), focus: true })
+            }
+            TreeAction::NewFolder(d) => {
+                self.dialog = Some(Dialog::Input { kind: InputKind::NewFolder(d), value: String::new(), focus: true })
+            }
+            TreeAction::Rename(p) => {
+                let value = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                self.dialog = Some(Dialog::Input { kind: InputKind::Rename(p), value, focus: true })
+            }
+            TreeAction::Delete(p) => self.dialog = Some(Dialog::Trash(p)),
+        }
+    }
+
+    pub(super) fn search_ui(&mut self, ui: &mut Ui) {
+        let t = self.theme.clone();
+        let mut run = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(TextEdit::singleline(&mut self.search.query).hint_text("Search in files").desired_width(ui.available_width() - 36.0));
+            if self.search.focus {
+                resp.request_focus();
+                self.search.focus = false;
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                run = true;
+            }
+            let case = RichText::new("Aa").color(if self.search.case_sensitive { t.blue } else { t.comment });
+            if ui.add(egui::Button::new(case).frame(false)).on_hover_text("Match case").clicked() {
+                self.search.case_sensitive = !self.search.case_sensitive;
+                run = true;
+            }
+        });
+        if run && !self.search.query.is_empty() {
+            self.search.running = true;
+            let (tx, ctx, root) = (self.tasks_tx.clone(), self.ctx.clone(), self.root.clone());
+            let (query, case_sensitive) = (self.search.query.clone(), self.search.case_sensitive);
+            std::thread::spawn(move || {
+                let (results, truncated) = search::search(&root, &query, case_sensitive, 2000);
+                let _ = tx.send(Task::Search { query, case_sensitive, results, truncated });
+                ctx.request_repaint();
+            });
+        }
+        if self.search.running {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Searching…").color(t.comment).size(12.0));
+            });
+        }
+        if self.search.searched {
+            let n: usize = self.search.results.iter().map(|r| r.matches.len()).sum();
+            let more = if self.search.truncated { "+" } else { "" };
+            ui.label(RichText::new(format!("{n}{more} results in {} files", self.search.results.len())).color(t.comment).size(12.0));
+        }
+        let mut open = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for r in &self.search.results {
+                ui.label(RichText::new(&r.rel).color(t.blue).size(12.5));
+                for m in &r.matches {
+                    let text = format!("{:>5}  {}", m.line + 1, m.text);
+                    let resp = ui.add(egui::Button::new(RichText::new(text).monospace().size(12.0).color(t.fg_dim)).frame(false).truncate());
+                    if resp.clicked() {
+                        open = Some((r.path.clone(), m.line, m.col, m.len));
+                    }
+                }
+            }
+        });
+        if let Some((p, l, c, len)) = open {
+            self.open_at(&p, l, c, len);
+        }
+    }
+
+    pub(super) fn tab_bar(&mut self, ui: &mut Ui) {
+        let t = self.theme.clone();
+        let mut activate = None;
+        let mut close = None;
+        egui::ScrollArea::horizontal().id_salt("tabs").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, d) in self.docs.iter().enumerate() {
+                    let active = self.active == Some(i);
+                    let color = d
+                        .path
+                        .as_ref()
+                        .and_then(|p| self.file_colors.get(p))
+                        .copied()
+                        .unwrap_or(if active { t.fg } else { t.comment });
+                    let font = FontId::proportional(13.0);
+                    let title_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(d.title.clone(), font.clone(), color).size().x);
+                    let w = title_w + 44.0;
+                    let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
+                    ui.painter().rect_filled(rect, 0.0, if active { t.bg } else { t.bg_dark });
+                    if active {
+                        ui.painter().line_segment([rect.left_top(), rect.right_top()], Stroke::new(2.0, t.blue));
+                    }
+                    ui.painter().line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, t.border));
+                    ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, &d.title, font, color);
+                    let cr = egui::Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(18.0, 18.0));
+                    let cresp = ui.interact(cr, resp.id.with("close"), Sense::click());
+                    if cresp.hovered() {
+                        ui.painter().rect_filled(cr, 3.0, t.bg_highlight);
+                    }
+                    if d.is_dirty() && !cresp.hovered() {
+                        ui.painter().circle_filled(cr.center(), 4.0, t.fg_dim);
+                    } else if resp.hovered() || cresp.hovered() || active {
+                        ui.painter().text(cr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(15.0), t.fg_dim);
+                    }
+                    if cresp.clicked() || resp.middle_clicked() {
+                        close = Some(i);
+                    } else if resp.clicked() {
+                        activate = Some(i);
+                    }
+                    if let Some(p) = &d.path {
+                        resp.on_hover_text(p.to_string_lossy());
+                    }
+                }
+            });
+        });
+        if let Some(i) = activate {
+            self.activate(i);
+        }
+        if let Some(i) = close {
+            self.request_close(i);
+        }
+    }
+
+    pub(super) fn find_bar(&mut self, ui: &mut Ui) {
+        let Some(i) = self.active else { return };
+        let t = self.theme.clone();
+        let mut nav: Option<bool> = None;
+        // Esc closes the bar whether the find box or the editor has focus. Checked before the text
+        // field runs, because it gives up focus on Esc.
+        let mut close = !self.palette.open && self.dialog.is_none() && ui.input(|i| i.key_pressed(Key::Escape));
+        Frame::NONE.fill(t.bg_dark).inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let resp = ui.add(TextEdit::singleline(&mut self.find.query).hint_text("Find").desired_width(260.0));
+                if self.find.focus {
+                    resp.request_focus();
+                    self.find.focus = false;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    nav = Some(!ui.input(|i| i.modifiers.shift));
+                    resp.request_focus();
+                }
+                let n = self.find.matches.len();
+                let label = match self.find.current {
+                    Some(c) if n > 0 => format!("{} of {n}", c + 1),
+                    _ if self.find.query.is_empty() => String::new(),
+                    _ => format!("{n} results"),
+                };
+                ui.label(RichText::new(label).color(if n == 0 && !self.find.query.is_empty() { t.red } else { t.comment }));
+                if ui.button("↑").clicked() {
+                    nav = Some(false);
+                }
+                if ui.button("↓").clicked() {
+                    nav = Some(true);
+                }
+                if ui.button("×").clicked() {
+                    close = true;
+                }
+            });
+        });
+        // Recompute matches when text or query changes.
+        let d = &self.docs[i];
+        let key = (d.id, d.hash, self.find.query.clone());
+        if key != self.find.cache {
+            self.find.matches = editor::find_matches(&d.text, &self.find.query);
+            self.find.cache = key;
+            self.find.current = None;
+        }
+        if let Some(forward) = nav {
+            let ms = &self.find.matches;
+            if !ms.is_empty() {
+                let cursor = self.docs[i].cursor_char;
+                let idx = match (forward, self.find.current) {
+                    (true, Some(c)) => (c + 1) % ms.len(),
+                    (false, Some(c)) => (c + ms.len() - 1) % ms.len(),
+                    (true, None) => ms.iter().position(|m| m.0 >= cursor).unwrap_or(0),
+                    (false, None) => ms.iter().rposition(|m| m.0 < cursor).unwrap_or(ms.len() - 1),
+                };
+                self.find.current = Some(idx);
+                self.docs[i].pending_sel = Some(ms[idx]);
+            }
+        }
+        if close {
+            self.find.open = false;
+            self.focus_editor = true;
+        }
+    }
+
+    pub(super) fn welcome(&mut self, ui: &mut Ui) {
+        let t = self.theme.clone();
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.25);
+            ui.label(RichText::new("rim").size(56.0).color(t.blue));
+            ui.label(RichText::new(self.root.to_string_lossy()).color(t.comment));
+            ui.add_space(24.0);
+            for (k, v) in [
+                ("Ctrl+P", "Go to file"),
+                ("Ctrl+Shift+P", "Command palette"),
+                ("Ctrl+Shift+F", "Search in files"),
+                ("Ctrl+Shift+G", "Source control"),
+                ("Ctrl+O", "Open folder"),
+                ("Ctrl+N", "New file"),
+            ] {
+                ui.label(RichText::new(format!("{k:>14}   {v:<18}")).monospace().color(t.fg_dim));
+            }
+        });
+    }
+
+    pub(super) fn central(&mut self, ui: &mut Ui) {
+        if self.docs.is_empty() {
+            self.welcome(ui);
+            return;
+        }
+        self.tab_bar(ui);
+        if self.find.open {
+            self.find_bar(ui);
+        }
+        let Some(i) = self.active else { return };
+        let uri = self.docs[i].path.as_ref().map(|p| lsp::uri(p));
+        let diags: &[Diagnostic] = uri.as_ref().and_then(|u| self.diagnostics.get(u)).map(|v| v.as_slice()).unwrap_or(&[]);
+        let triggers: &[String] = self
+            .cfg
+            .server_for_ext(&self.docs[i].ext)
+            .and_then(|s| self.lsp.get(&s.name))
+            .map(|c| c.trigger_characters())
+            .unwrap_or(&[]);
+        let (matches, current) = if self.find.open && self.find.cache.0 == self.docs[i].id {
+            (self.find.matches.as_slice(), self.find.current.map(|c| self.find.matches[c]))
+        } else {
+            (&[][..], None)
+        };
+        let mut cx = EditorCtx {
+            theme: &self.theme,
+            syn: &self.syn,
+            font: FontId::monospace(self.cfg.font_size),
+            tab_size: self.cfg.tab_size.max(1),
+            insert_spaces: self.cfg.insert_spaces,
+            diagnostics: diags,
+            completion: &mut self.completion,
+            hover: &mut self.hover,
+            matches,
+            current_match: current,
+            request_focus: std::mem::take(&mut self.focus_editor) && !self.palette.open,
+            triggers,
+            vim: if self.cfg.vim_mode { Some(&mut self.vim_shared) } else { None },
+        };
+        let events = editor::show(ui, &mut self.docs[i], &mut cx);
+
+        // Tell the server about edits before asking it anything.
+        self.sync_lsp();
+        let doc_id = self.docs[i].id;
+        for e in events {
+            match e {
+                EditorEvent::Complete { anchor } => {
+                    let c = self.docs[i].cursor_char;
+                    self.lsp_request(i, "textDocument/completion", c, Pending::Completion { doc_id, anchor });
+                }
+                EditorEvent::Hover(ci) => {
+                    self.lsp_request(i, "textDocument/hover", ci, Pending::Hover { doc_id, char_idx: ci })
+                }
+                EditorEvent::Definition(ci) => self.lsp_request(i, "textDocument/definition", ci, Pending::Definition),
+                EditorEvent::Save => self.save(i, true),
+                EditorEvent::SaveClose => {
+                    // Closes once the file is really written (formatting on save is asynchronous).
+                    self.close_after_save.insert(doc_id);
+                    self.save(i, true);
+                    if self.docs.get(i).is_some_and(|d| d.id == doc_id && !d.is_dirty() && !d.read_only) {
+                        self.close_after_save.remove(&doc_id);
+                        self.close_doc(i);
+                    }
+                    return;
+                }
+                EditorEvent::Close(force) => {
+                    if force {
+                        self.close_doc(i);
+                    } else {
+                        self.request_close(i);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(super) fn palette_ui(&mut self) {
+        let t = self.theme.clone();
+        match self.palette.show(&self.ctx, &t) {
+            Outcome::None => {}
+            Outcome::Preview(name) => {
+                self.theme = theme::by_name(&name);
+                self.theme.apply(&self.ctx);
+                self.syn.set_theme(&self.theme);
+            }
+            Outcome::Cancel(Mode::Themes { original }) => self.set_theme(&original, false),
+            Outcome::Cancel(Mode::Mention) => self.chat.focus_input = true,
+            Outcome::Cancel(_) => self.focus_editor = true,
+            Outcome::Accept(mode, item, query) => {
+                self.focus_editor = mode != Mode::Mention;
+                match (mode, item) {
+                    (Mode::Mention, Some(it)) => self.chat.insert_mention(&it.id),
+                    (Mode::Mention, None) => self.chat.focus_input = true,
+                    (Mode::Commands, Some(it)) => self.run_command(&it.id),
+                    (Mode::Files, Some(it)) => {
+                        let p = self.root.join(&it.id);
+                        self.open_path(&p);
+                    }
+                    (Mode::Themes { .. }, Some(it)) => self.set_theme(&it.id, true),
+                    (Mode::Themes { original }, None) => self.set_theme(&original, false),
+                    (Mode::Branches, Some(it)) => {
+                        let b = it.id.clone();
+                        self.git_do("checkout", |r| r.checkout(&b));
+                        self.tree.invalidate();
+                    }
+                    (Mode::GotoLine, _) => {
+                        if let (Ok(n), Some(d)) = (query.trim().parse::<usize>(), self.active_doc()) {
+                            d.goto_line(n.saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub(super) fn toasts_ui(&mut self) {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let t = self.theme.clone();
+        let screen = self.ctx.content_rect();
+        egui::Area::new(Id::new("rim-toasts"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-12.0, -32.0))
+            .show(&self.ctx, |ui| {
+                ui.set_max_width((screen.width() * 0.45).min(520.0));
+                let mut dismiss = None;
+                for (i, toast) in self.toasts.iter().enumerate() {
+                    let accent = if toast.kind == ToastKind::Error { t.red } else { t.blue };
+                    let r = Frame::popup(ui.style())
+                        .fill(t.bg_float)
+                        .stroke(Stroke::new(1.0, accent))
+                        .show(ui, |ui| ui.label(RichText::new(&toast.text).color(t.fg)))
+                        .response;
+                    if r.interact(Sense::click()).clicked() {
+                        dismiss = Some(i);
+                    }
+                }
+                if let Some(i) = dismiss {
+                    self.toasts.remove(i);
+                }
+            });
+        self.ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    pub(super) fn update_title(&mut self) {
+        let folder = self.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let title = match self.active.and_then(|i| self.docs.get(i)) {
+            Some(d) => format!("{}{} — {folder} — rim", if d.is_dirty() { "● " } else { "" }, d.title),
+            None => format!("{folder} — rim"),
+        };
+        if title != self.title {
+            self.ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
+}
