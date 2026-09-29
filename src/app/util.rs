@@ -57,6 +57,7 @@ pub(super) fn load_font(ctx: &egui::Context, path: Option<&str>) {
     let user = path.and_then(|p| std::fs::read(shellexpand(p)).ok()).map(|b| std::sync::Arc::new(egui::FontData::from_owned(b)));
     let build = move |cjk: Option<std::sync::Arc<egui::FontData>>| {
         let mut fonts = egui::FontDefinitions::default();
+        crate::file_icons::add_to(&mut fonts);
         if let Some(u) = &user {
             fonts.font_data.insert("user-mono".into(), u.clone());
             fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "user-mono".into());

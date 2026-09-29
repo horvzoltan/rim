@@ -38,6 +38,9 @@ fn clicking_rows_opens_files_and_toggles_dirs() {
     let mut t = FileTree::new(d.clone());
     let theme = crate::theme::by_name("tokyonight");
     let ctx = egui::Context::default();
+    let mut fonts = egui::FontDefinitions::default();
+    crate::file_icons::add_to(&mut fonts);
+    ctx.set_fonts(fonts);
     let mut time = 0.0;
     let mut frame = |t: &mut FileTree, events: Vec<Event>| -> Option<TreeAction> {
         time += 0.05;

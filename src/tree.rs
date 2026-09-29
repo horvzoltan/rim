@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use egui::{Align2, Color32, FontId, Sense, Ui, pos2, vec2};
+use egui::{Align2, Color32, FontId, Sense, Stroke, Ui, pos2, vec2};
 
+use crate::file_icons;
 use crate::theme::Theme;
 
 #[derive(Clone)]
@@ -118,8 +119,10 @@ impl FileTree {
 
     pub fn show(&mut self, ui: &mut Ui, theme: &Theme, colors: &HashMap<PathBuf, Color32>) -> Option<TreeAction> {
         let mut action = None;
-        let row_h = 22.0;
-        let font = FontId::proportional(13.5);
+        let row_h = 20.0;
+        let indent = 12.0;
+        let font = FontId::proportional(13.0);
+        let icon_font = FontId::new(15.0, file_icons::family());
         let rows = self.visible_rows();
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if std::mem::take(&mut self.scroll_to_selected)
@@ -129,8 +132,10 @@ impl FileTree {
             area = area.vertical_scroll_offset((i as f32 * row_h - ui.available_height() / 2.0).max(0.0));
         }
         let total = rows.len();
+        // show_rows adds item spacing to the row height when working out which rows are visible,
+        // so it has to be zero here too, or the last rows of a long tree never get drawn.
+        ui.spacing_mut().item_spacing.y = 0.0;
         area.show_rows(ui, row_h, total, |ui, range| {
-            ui.spacing_mut().item_spacing.y = 0.0;
             let last_row = range.end == total;
             for (depth, list, i) in &rows[range] {
                 let (depth, e) = (*depth, &list[*i]);
@@ -141,18 +146,30 @@ impl FileTree {
                 } else if resp.hovered() {
                     ui.painter().rect_filled(rect, 0.0, theme.bg_highlight);
                 }
-                let x = rect.left() + 8.0 + depth as f32 * 14.0;
-                let color = colors.get(&e.path).copied().unwrap_or(if e.is_dir { theme.fg } else { theme.fg_dim });
-                if e.is_dir {
-                    let c = pos2(x + 4.0, rect.center().y);
-                    let pts = if self.expanded.contains(&e.path) {
-                        vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)]
-                    } else {
-                        vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)]
-                    };
-                    ui.painter().add(egui::Shape::convex_polygon(pts, theme.comment, egui::Stroke::NONE));
+                let x = rect.left() + 6.0 + depth as f32 * indent;
+                // Indent guides, one per ancestor folder.
+                for d in 0..depth {
+                    let gx = rect.left() + 6.0 + d as f32 * indent + 4.5;
+                    ui.painter().line_segment([pos2(gx, rect.top()), pos2(gx, rect.bottom())], Stroke::new(1.0, theme.bg_highlight));
                 }
-                ui.painter().text(pos2(x + 14.0, rect.center().y), Align2::LEFT_CENTER, &e.name, font.clone(), color);
+                let color = colors.get(&e.path).copied().unwrap_or(if e.is_dir { theme.fg } else { theme.fg_dim });
+                let cy = rect.center().y;
+                if e.is_dir {
+                    let open = self.expanded.contains(&e.path);
+                    let c = pos2(x + 4.5, cy);
+                    let pts = if open {
+                        vec![c + vec2(-3.0, -1.5), c + vec2(0.0, 1.5), c + vec2(3.0, -1.5)]
+                    } else {
+                        vec![c + vec2(-1.5, -3.0), c + vec2(1.5, 0.0), c + vec2(-1.5, 3.0)]
+                    };
+                    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.4, theme.comment)));
+                    let icon = file_icons::folder(open).to_string();
+                    ui.painter().text(pos2(x + 19.0, cy), Align2::CENTER_CENTER, icon, icon_font.clone(), theme.blue);
+                } else {
+                    let (icon, c) = file_icons::for_file(&e.name, theme.dark);
+                    ui.painter().text(pos2(x + 19.0, cy), Align2::CENTER_CENTER, icon.to_string(), icon_font.clone(), c);
+                }
+                ui.painter().text(pos2(x + 30.0, cy), Align2::LEFT_CENTER, &e.name, font.clone(), color);
 
                 if resp.clicked() {
                     self.selected = Some(e.path.clone());
