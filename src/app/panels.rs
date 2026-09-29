@@ -79,14 +79,25 @@ impl App {
         let t = self.theme.clone();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            for (s, label) in [(Sidebar::Explorer, "Explorer"), (Sidebar::Search, "Search"), (Sidebar::Git, "Git")] {
-                let mut text = RichText::new(label).size(13.0);
-                if s == Sidebar::Git && !self.git.files.is_empty() {
-                    text = RichText::new(format!("{label} {}", self.git.files.len())).size(13.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let panels = [
+                (Sidebar::Explorer, Icon::Files, "Explorer (Ctrl+Shift+E)", Cmd::Explorer),
+                (Sidebar::Search, Icon::Search, "Search (Ctrl+Shift+F)", Cmd::Search),
+                (Sidebar::Git, Icon::Git, "Source Control (Ctrl+Shift+G)", Cmd::SourceControl),
+            ];
+            for (s, icon, tip, cmd) in panels {
+                let badge = if s == Sidebar::Git { self.git.files.len() } else { 0 };
+                if icon_button(ui, &t, icon, self.sidebar == s, badge).on_hover_text(tip).clicked() {
+                    self.run(cmd);
                 }
-                let color = if self.sidebar == s { t.fg } else { t.comment };
-                if ui.add(egui::Button::new(text.color(color)).frame(self.sidebar == s)).clicked() {
-                    self.sidebar = s;
+            }
+            let tip = if self.show_claude { "Close Claude" } else { "Claude (Ctrl+L)" };
+            if icon_button(ui, &t, Icon::Claude, self.show_claude, 0).on_hover_text(tip).clicked() {
+                if self.show_claude {
+                    self.show_claude = false;
+                    self.focus_editor = true;
+                } else {
+                    self.claude_toggle();
                 }
             }
         });
@@ -478,4 +489,87 @@ impl App {
             self.title = title;
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Files,
+    Search,
+    Git,
+    Claude,
+}
+
+/// A square sidebar button with a painted icon; `active` gets a background and an accent bar underneath,
+/// `badge` > 0 shows a count in the top-right corner.
+fn icon_button(ui: &mut Ui, t: &Theme, icon: Icon, active: bool, badge: usize) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 30.0), Sense::click());
+    let p = ui.painter();
+    if active || resp.hovered() {
+        p.rect_filled(rect, CornerRadius::same(5), t.bg_highlight);
+    }
+    let accent = if matches!(icon, Icon::Claude) { t.orange } else { t.blue };
+    if active {
+        let bar = egui::Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 1.0), vec2(16.0, 2.0));
+        p.rect_filled(bar, CornerRadius::same(1), accent);
+    }
+    let color = if active {
+        if matches!(icon, Icon::Claude) { t.orange } else { t.fg }
+    } else if resp.hovered() {
+        t.fg_dim
+    } else {
+        t.comment
+    };
+    let c = rect.center() - vec2(0.0, 1.0);
+    let s = Stroke::new(1.5, color);
+    match icon {
+        Icon::Files => {
+            // Two stacked pages, the front one with a folded corner.
+            let back = egui::Rect::from_min_size(c + vec2(-4.0, -8.0), vec2(10.0, 13.0));
+            p.line_segment([back.left_top(), back.right_top()], s);
+            p.line_segment([back.right_top(), back.right_bottom()], s);
+            let (l, tp, r, b) = (c.x - 7.0, c.y - 5.0, c.x + 3.0, c.y + 8.0);
+            let front = vec![pos2(l, tp), pos2(r - 3.0, tp), pos2(r, tp + 3.0), pos2(r, b), pos2(l, b)];
+            p.add(egui::Shape::closed_line(front, s));
+        }
+        Icon::Search => {
+            let lens = c + vec2(-2.0, -2.0);
+            p.circle_stroke(lens, 5.0, s);
+            p.line_segment([lens + vec2(3.6, 3.6), lens + vec2(8.5, 8.5)], Stroke::new(2.0, color));
+        }
+        Icon::Git => {
+            // A branch: trunk on the left, a side branch curving in from the right.
+            let (a, b, side) = (c + vec2(-4.0, -7.0), c + vec2(-4.0, 7.0), c + vec2(5.0, -4.0));
+            p.line_segment([a + vec2(0.0, 2.5), b - vec2(0.0, 2.5)], s);
+            let curve = egui::epaint::CubicBezierShape::from_points_stroke(
+                [side + vec2(0.0, 2.5), side + vec2(0.0, 7.0), a + vec2(0.0, 9.0), a + vec2(0.0, 12.0)],
+                false,
+                Color32::TRANSPARENT,
+                s,
+            );
+            p.add(curve);
+            for pt in [a, b, side] {
+                p.circle_stroke(pt, 2.3, s);
+            }
+        }
+        Icon::Claude => {
+            // Claude's starburst: rays of alternating length around the centre.
+            let color = if active || resp.hovered() { t.orange } else { color };
+            for i in 0..10 {
+                let ang = i as f32 * std::f32::consts::TAU / 10.0 - std::f32::consts::FRAC_PI_2;
+                let len = if i % 2 == 0 { 8.0 } else { 6.0 };
+                let dir = vec2(ang.cos(), ang.sin());
+                p.line_segment([c + dir * 1.5, c + dir * len], Stroke::new(1.8, color));
+            }
+        }
+    }
+    if badge > 0 {
+        let text = if badge > 99 { "99+".to_string() } else { badge.to_string() };
+        let font = FontId::proportional(9.5);
+        let galley = p.layout_no_wrap(text, font, t.bg_dark);
+        let w = (galley.size().x + 6.0).max(14.0);
+        let pill = egui::Rect::from_center_size(pos2(rect.right() - w / 2.0 + 1.0, rect.top() + 6.0), vec2(w, 13.0));
+        p.rect_filled(pill, CornerRadius::same(7), t.blue);
+        p.galley(pill.center() - galley.size() / 2.0, galley, t.bg_dark);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
