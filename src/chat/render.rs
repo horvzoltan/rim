@@ -12,7 +12,9 @@ use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
 use super::{DiffLines, Env, NOT_FOUND, UiEvent, View};
-use crate::claude::{Conversation, Item, PermState, Tool};
+#[cfg(any(test, debug_assertions))]
+use crate::claude::Conversation;
+use crate::claude::{Item, PermState, Tool};
 use crate::highlight::HlCache;
 use crate::md::{self, Block, Span};
 use crate::text::hash_str;

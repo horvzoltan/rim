@@ -29,6 +29,7 @@ mod render;
 
 pub use attach::{Attachment, clipboard_image};
 use attach::is_image_file;
+#[cfg(any(test, debug_assertions))]
 pub use render::demo_conversation;
 use render::{empty_state, items_ui};
 #[cfg(test)]
